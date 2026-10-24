@@ -50,6 +50,14 @@ function socketIdsOf(name) {
 }
 
 /* ===================================================================
+   HANDICAPS (les prix doivent correspondre à ceux du site)
+   =================================================================== */
+const SABOTAGES = { halve: { price: 100000 }, clicker: { price: 125000 }, noboost: { price: 150000 } };
+const SABOTAGE_MAX = 3;                    // handicaps reçus au maximum par un même joueur…
+const SABOTAGE_WINDOW_MS = 10 * 60 * 1000; // …sur 10 minutes
+const sabotageLog = new Map();             // pseudo visé -> dates des handicaps reçus
+
+/* ===================================================================
    AVIATEUR PARTAGÉ
    Le point de crash est tiré par le serveur à partir d'une graine secrète.
    L'empreinte SHA-256 de la graine est publiée avant la manche, la graine
@@ -209,6 +217,34 @@ io.on('connection', socket => {
     from.balance = round2(from.balance - amount);
     broadcastList();
     ack({ ok: true, amount, to: users[ids[0]].username });
+  });
+
+  /* ----- Handicaps : un joueur en ralentit un autre ----- */
+  socket.on('sabotage', (data, ack) => {
+    ack = reply(ack);
+    const from = users[socket.id];
+    if (!from) return ack({ ok: false, msg: 'Connectez-vous avant d’envoyer un handicap.' });
+    const item = SABOTAGES[clean(data && data.type, 20)];
+    if (!item) return ack({ ok: false, msg: 'Handicap inconnu.' });
+    if (!allow(socket, 'sabotage', 3000)) return ack({ ok: false, msg: 'Attendez quelques secondes entre deux handicaps.' });
+    if (from.balance + 0.001 < item.price) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    const target = clean(data && data.targetUser, 24);
+    if (!target || lower(target) === lower(from.username)) return ack({ ok: false, msg: 'Choisissez un autre joueur que vous-même.' });
+    const ids = socketIdsOf(target);
+    if (!ids.length) return ack({ ok: false, msg: `${target} n’est plus connecté.` });
+    const key = lower(target), now = Date.now();
+    const log = (sabotageLog.get(key) || []).filter(t => now - t < SABOTAGE_WINDOW_MS);
+    if (log.length >= SABOTAGE_MAX) {
+      const wait = Math.ceil((SABOTAGE_WINDOW_MS - (now - log[0])) / 60000);
+      return ack({ ok: false, msg: `${users[ids[0]].username} a déjà reçu ${SABOTAGE_MAX} handicaps récemment. Réessayez dans ${wait} min.` });
+    }
+    log.push(now);
+    sabotageLog.set(key, log);
+    // Un seul onglet du joueur visé reçoit le handicap, pour ne pas l'appliquer plusieurs fois
+    io.to(ids[0]).emit('sabotaged', { type: data.type, from: from.username });
+    from.balance = round2(from.balance - item.price);
+    broadcastList();
+    ack({ ok: true, to: users[ids[0]].username });
   });
 
   socket.on('place_bet', data => {
