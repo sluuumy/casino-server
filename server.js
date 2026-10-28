@@ -55,7 +55,8 @@ function socketIdsOf(name) {
 const SABOTAGES = { halve: { price: 100000 }, clicker: { price: 125000 }, noboost: { price: 150000 } };
 const SABOTAGE_MAX = 3;                    // handicaps reçus au maximum par un même joueur…
 const SABOTAGE_WINDOW_MS = 10 * 60 * 1000; // …sur 10 minutes
-const sabotageLog = new Map();             // pseudo visé -> dates des handicaps reçus
+const sabotageLog = new Map();
+const bigWins = [];                       // dernières grosses victoires, pour les nouveaux arrivants             // pseudo visé -> dates des handicaps reçus
 
 /* ===================================================================
    AVIATEUR PARTAGÉ
@@ -68,7 +69,7 @@ const BET_MS = 6000;     // durée des mises
 const PAUSE_MS = 3000;   // pause après le crash
 const TICK_MS = 50;
 const HOUSE = 0.97;      // 3 % d'avantage maison
-const MIN_BET = 10;
+const MIN_BET = 1;
 
 function pointFromSeed(seed) {
   const h = sha256('point:' + seed);
@@ -162,11 +163,91 @@ function endRound() {
 }
 
 /* ===================================================================
+   COURSE DE CHEVAUX PARTAGÉE
+   Le serveur fixe les cotes, tire le gagnant et prépare le déroulé de la
+   course (temps d'arrivée et accélérations), puis l'envoie à tout le monde :
+   chaque joueur voit exactement la même course.
+   =================================================================== */
+const RACE_HORSES = 6;
+const RACE_PROBS = [0.30, 0.22, 0.17, 0.13, 0.10, 0.08];
+const RACE_EDGE = 0.96;          // 4 % d'avantage maison
+const RACE_BET_MS = 20000;       // durée des paris
+const RACE_RUN_MS = 9000;        // temps du gagnant
+const RACE_PAUSE_MS = 7000;      // pause après l'arrivée
+const RACE_MIN_BET = 1;
+const rand = () => crypto.randomBytes(6).readUIntBE(0, 6) / 2 ** 48; // [0, 1) sur 48 bits
+
+let race = null;
+const raceHistory = [];          // derniers gagnants
+const raceResults = new Map();   // "raceId:pseudo" -> résultat, pour reprendre après rechargement
+
+function raceOdds(p) { return Math.floor((RACE_EDGE / p) * 10) / 10; }
+function publicRace() {
+  return {
+    id: race.id, phase: race.phase, betEndsAt: race.betEndsAt, startedAt: race.startedAt,
+    p: race.p, odds: race.odds, plan: race.phase === 'betting' ? null : race.plan,
+    winner: race.phase === 'finished' ? race.winner : null,
+    history: raceHistory.slice(0, 10), serverNow: Date.now()
+  };
+}
+function raceBetList() {
+  return [...race.bets.values()].map(b => ({ username: b.username, horse: b.horse, amount: b.amount })).sort((a, b) => b.amount - a.amount);
+}
+let raceBetsTimer = null;
+function broadcastRaceBets() {
+  if (raceBetsTimer) return;
+  raceBetsTimer = setTimeout(() => { raceBetsTimer = null; io.emit('race_bets', raceBetList()); }, 150);
+}
+function startRaceBetting() {
+  const perm = [0, 1, 2, 3, 4, 5];
+  for (let i = perm.length - 1; i > 0; i--) { const j = crypto.randomInt(0, i + 1); [perm[i], perm[j]] = [perm[j], perm[i]]; }
+  const p = perm.map(i => RACE_PROBS[i]);
+  race = {
+    id: crypto.randomBytes(5).toString('hex'), phase: 'betting', betEndsAt: Date.now() + RACE_BET_MS, startedAt: 0,
+    p, odds: p.map(raceOdds), bets: new Map(), plan: null, winner: null
+  };
+  io.emit('race_state', publicRace());
+  io.emit('race_bets', []);
+  setTimeout(startRaceRun, RACE_BET_MS);
+}
+function startRaceRun() {
+  let x = rand(), winner = 0;
+  while (winner < RACE_HORSES - 1 && x >= race.p[winner]) { x -= race.p[winner]; winner++; }
+  race.winner = winner;
+  race.plan = race.p.map((_, i) => {
+    const finish = Math.round(i === winner ? RACE_RUN_MS : RACE_RUN_MS * (1.04 + rand() * 0.22));
+    const w = Array.from({ length: 10 }, () => 0.55 + rand() * 0.9), sum = w.reduce((a, b) => a + b, 0);
+    let acc = 0;
+    return { finish, marks: [0, ...w.map(v => Math.round((acc += v / sum) * 10000) / 10000)] };
+  });
+  race.plan.forEach(pl => { pl.marks[10] = 1; });
+  race.phase = 'running';
+  race.startedAt = Date.now();
+  io.emit('race_state', publicRace());
+  setTimeout(endRace, Math.max(...race.plan.map(pl => pl.finish)) + 300);
+}
+function endRace() {
+  race.phase = 'finished';
+  for (const [key, b] of race.bets) {
+    const won = b.horse === race.winner;
+    raceResults.set(`${race.id}:${key}`, { status: won ? 'won' : 'lost', horse: b.horse, amount: b.amount, odds: race.odds[b.horse], payout: won ? Math.round(b.amount * race.odds[b.horse] * 100) / 100 : 0, winner: race.winner });
+  }
+  while (raceResults.size > 5000) raceResults.delete(raceResults.keys().next().value);
+  raceHistory.unshift(race.winner);
+  raceHistory.length = Math.min(raceHistory.length, 20);
+  io.emit('race_state', publicRace());
+  setTimeout(startRaceBetting, RACE_PAUSE_MS);
+}
+
+/* ===================================================================
    CONNEXIONS
    =================================================================== */
 io.on('connection', socket => {
   socket.emit('crash_state', { ...publicRound(), history: history.slice(0, 14) });
   socket.emit('crash_bets', betList());
+  socket.emit('race_state', publicRace());
+  socket.emit('big_wins', bigWins);
+  socket.emit('race_bets', raceBetList());
   socket.emit('update_online_list', onlineList());
 
   socket.on('time_sync', (_, ack) => reply(ack)(Date.now()));
@@ -247,6 +328,18 @@ io.on('connection', socket => {
     ack({ ok: true, to: users[ids[0]].username });
   });
 
+  /* ----- Grosses victoires annoncées à tout le monde ----- */
+  socket.on('big_win', data => {
+    const u = users[socket.id];
+    if (!u || !allow(socket, 'bigwin', 4000)) return;
+    const amount = round2(data && data.amount), mult = Math.round(Number(data && data.mult) * 100) / 100;
+    if (!(amount >= 500) || !(amount < 1e13)) return;
+    const win = { username: u.username, game: clean(data.game, 24), amount, mult: Number.isFinite(mult) ? mult : 0, at: Date.now() };
+    bigWins.unshift(win);
+    bigWins.length = Math.min(bigWins.length, 10);
+    io.emit('big_win', win);
+  });
+
   socket.on('place_bet', data => {
     const u = users[socket.id];
     if (!u || !allow(socket, 'bet', 300)) return;
@@ -312,6 +405,48 @@ io.on('connection', socket => {
     ack(results.get(`${roundId}:${key}`) || { status: 'unknown' });
   });
 
+  /* ----- Course de chevaux ----- */
+  socket.on('race_bet', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant de parier.' });
+    if (race.phase !== 'betting') return ack({ ok: false, msg: 'Les paris sont fermés pour cette course.' });
+    const key = lower(u.username);
+    if (race.bets.has(key)) return ack({ ok: false, msg: 'Vous avez déjà parié sur cette course.' });
+    const horse = Number(data && data.horse);
+    if (!Number.isInteger(horse) || horse < 0 || horse >= RACE_HORSES) return ack({ ok: false, msg: 'Cheval inconnu.' });
+    const amount = round2(data && data.amount);
+    if (!Number.isFinite(amount) || amount < RACE_MIN_BET) return ack({ ok: false, msg: `Mise minimum : ${RACE_MIN_BET} $.` });
+    if (amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    race.bets.set(key, { username: u.username, horse, amount });
+    broadcastRaceBets();
+    ack({ ok: true, raceId: race.id, horse, amount, odds: race.odds[horse] });
+  });
+
+  socket.on('race_cancel', (_, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false, msg: 'Non connecté.' });
+    if (race.phase !== 'betting') return ack({ ok: false, msg: 'Trop tard : la course est partie.' });
+    const key = lower(u.username), b = race.bets.get(key);
+    if (!b) return ack({ ok: false, msg: 'Aucun pari à annuler.' });
+    race.bets.delete(key);
+    broadcastRaceBets();
+    ack({ ok: true, amount: b.amount });
+  });
+
+  socket.on('race_result', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ status: 'unknown' });
+    const raceId = clean(data && data.raceId, 20), key = lower(u.username);
+    if (race.id === raceId && race.bets.has(key) && race.phase !== 'finished') {
+      const b = race.bets.get(key);
+      return ack({ status: 'active', horse: b.horse, amount: b.amount, odds: race.odds[b.horse] });
+    }
+    ack(raceResults.get(`${raceId}:${key}`) || { status: 'unknown' });
+  });
+
   socket.on('disconnect', () => {
     delete users[socket.id];
     broadcastList();
@@ -320,6 +455,7 @@ io.on('connection', socket => {
 });
 
 startBetting();
+startRaceBetting();
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Serveur en écoute sur le port ${PORT}`));
