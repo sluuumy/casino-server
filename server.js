@@ -1,11 +1,13 @@
 const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { Server } = require('socket.io');
 
 const app = express();
 app.get('/', (req, res) => res.send('Cyber Casino : serveur en ligne'));
-app.get('/health', (req, res) => res.json({ ok: true, round: round ? round.id : null }));
+app.get('/health', (req, res) => res.json({ ok: true, round: round ? round.id : null, loto: loto ? loto.id : null }));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -240,6 +242,95 @@ function endRace() {
 }
 
 /* ===================================================================
+   LOTO QUOTIDIEN (tirage chaque soir à 21 h, heure de Paris)
+   La cagnotte réunit 90 % des tickets et 1 000 $ offerts par le casino.
+   Trois tickets sont tirés : 60 %, 25 % et 15 % de la cagnotte. Les parts
+   non attribuées (moins de 3 tickets) sont reportées au tirage suivant.
+   L'état est aussi écrit dans loto.json pour survivre à un redémarrage.
+   =================================================================== */
+const LOTO_PRICE = 100;
+const LOTO_MAX_TICKETS = 20;      // par joueur et par tirage
+const LOTO_SEED = 1000;           // offert par le casino à chaque tirage
+const LOTO_SHARE = 0.9;           // part du prix des tickets reversée
+const LOTO_PRIZES = [0.6, 0.25, 0.15];
+const LOTO_HOUR = 21;             // heure du tirage, à Paris
+const LOTO_FILE = path.join(__dirname, 'loto.json');
+
+function parisOffsetMs(d) {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Paris', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(d).map(x => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(d.getTime() / 1000) * 1000;
+}
+function parisDay(ts) {
+  const l = new Date(ts + parisOffsetMs(new Date(ts)));
+  return `${l.getUTCFullYear()}-${String(l.getUTCMonth() + 1).padStart(2, '0')}-${String(l.getUTCDate()).padStart(2, '0')}`;
+}
+function nextDrawAt(now = Date.now()) {
+  if (process.env.LOTO_TEST_MS) return now + Number(process.env.LOTO_TEST_MS); // pour les tests uniquement
+  const off = parisOffsetMs(new Date(now)), l = new Date(now + off);
+  let t = Date.UTC(l.getUTCFullYear(), l.getUTCMonth(), l.getUTCDate(), LOTO_HOUR) - off;
+  if (t <= now) t += 24 * 3600 * 1000;
+  return t;
+}
+
+let loto = null, lotoLast = null, lotoClaims = {};
+function saveLoto() {
+  fs.writeFile(LOTO_FILE, JSON.stringify({ loto, lotoLast, lotoClaims }), () => {});
+}
+function newLoto(carry) {
+  const drawAt = nextDrawAt();
+  // identifiant = date du tirage (un tirage par jour) ; en mode test, plusieurs tirages par jour
+  const id = process.env.LOTO_TEST_MS ? `${parisDay(drawAt)}-${drawAt.toString(36)}` : parisDay(drawAt);
+  loto = { id, drawAt, carry: round2(carry || 0), tickets: {} };
+  saveLoto();
+}
+const lotoCount = () => Object.values(loto.tickets).reduce((s, t) => s + t.n, 0);
+const lotoPot = () => round2(LOTO_SEED + loto.carry + lotoCount() * LOTO_PRICE * LOTO_SHARE);
+function lotoPublic() {
+  return {
+    id: loto.id, drawAt: loto.drawAt, pot: lotoPot(), tickets: lotoCount(), price: LOTO_PRICE, max: LOTO_MAX_TICKETS,
+    players: Object.values(loto.tickets).sort((a, b) => b.n - a.n).slice(0, 40).map(t => ({ username: t.username, n: t.n })),
+    last: lotoLast, serverNow: Date.now()
+  };
+}
+let lotoTimer = null;
+function broadcastLoto() {
+  if (lotoTimer) return;
+  lotoTimer = setTimeout(() => { lotoTimer = null; io.emit('loto_state', lotoPublic()); }, 300);
+}
+function runDraw() {
+  const entries = [];
+  for (const [key, t] of Object.entries(loto.tickets)) for (let i = 0; i < t.n; i++) entries.push(key);
+  for (let i = entries.length - 1; i > 0; i--) { const j = crypto.randomInt(0, i + 1); [entries[i], entries[j]] = [entries[j], entries[i]]; }
+  const pot = lotoPot(), winners = [], results = {};
+  let given = 0;
+  for (const [key, t] of Object.entries(loto.tickets)) results[key] = { tickets: t.n, win: 0, claimed: false };
+  LOTO_PRIZES.forEach((share, i) => {
+    if (i >= entries.length) return;
+    const key = entries[i], amount = round2(pot * share);
+    given += amount;
+    results[key].win = round2(results[key].win + amount);
+    winners.push({ rank: i + 1, username: loto.tickets[key].username, amount });
+  });
+  lotoClaims[loto.id] = results;
+  const ids = Object.keys(lotoClaims).sort();
+  while (ids.length > 14) delete lotoClaims[ids.shift()];
+  lotoLast = { id: loto.id, pot, tickets: entries.length, winners };
+  const carry = entries.length ? round2(pot - given) : loto.carry; // sans ticket, les 1 000 $ offerts ne s'accumulent pas
+  io.emit('loto_drawn', lotoLast);
+  newLoto(carry);
+  io.emit('loto_state', lotoPublic());
+}
+try {
+  const saved = JSON.parse(fs.readFileSync(LOTO_FILE, 'utf8'));
+  if (saved && saved.loto && saved.loto.id) { loto = saved.loto; lotoLast = saved.lotoLast || null; lotoClaims = saved.lotoClaims || {}; }
+} catch {}
+if (!loto) newLoto(0);
+setInterval(() => { if (Date.now() >= loto.drawAt) runDraw(); }, 10000);
+
+/* ===================================================================
    CONNEXIONS
    =================================================================== */
 io.on('connection', socket => {
@@ -248,6 +339,7 @@ io.on('connection', socket => {
   socket.emit('race_state', publicRace());
   socket.emit('big_wins', bigWins);
   socket.emit('race_bets', raceBetList());
+  socket.emit('loto_state', lotoPublic());
   socket.emit('update_online_list', onlineList());
 
   socket.on('time_sync', (_, ack) => reply(ack)(Date.now()));
@@ -403,6 +495,39 @@ io.on('connection', socket => {
       return ack({ status: 'active', amount: b.amount, auto: b.auto });
     }
     ack(results.get(`${roundId}:${key}`) || { status: 'unknown' });
+  });
+
+  /* ----- Loto quotidien ----- */
+  socket.on('loto_buy', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant d’acheter des tickets.' });
+    if (!allow(socket, 'loto', 800)) return ack({ ok: false, msg: 'Doucement : un achat à la fois.' });
+    const count = Math.floor(Number(data && data.count));
+    if (!(count >= 1 && count <= LOTO_MAX_TICKETS)) return ack({ ok: false, msg: 'Nombre de tickets invalide.' });
+    const key = lower(u.username), cur = loto.tickets[key] ? loto.tickets[key].n : 0;
+    if (cur + count > LOTO_MAX_TICKETS) return ack({ ok: false, msg: `${LOTO_MAX_TICKETS} tickets au maximum par tirage (vous en avez ${cur}).` });
+    const cost = count * LOTO_PRICE;
+    if (cost > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    loto.tickets[key] = { username: u.username, n: cur + count };
+    u.balance = round2(u.balance - cost);
+    saveLoto();
+    broadcastLoto();
+    ack({ ok: true, drawId: loto.id, count, total: cur + count, cost });
+  });
+
+  socket.on('loto_result', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false });
+    const id = clean(data && data.drawId, 24), key = lower(u.username);
+    if (id === loto.id) return ack({ status: 'open' });
+    const r = lotoClaims[id] && lotoClaims[id][key];
+    if (!r) return ack({ status: 'unknown' });
+    if (r.claimed) return ack({ status: 'claimed' });
+    r.claimed = true;
+    saveLoto();
+    ack({ status: 'drawn', win: r.win, tickets: r.tickets });
   });
 
   /* ----- Course de chevaux ----- */
