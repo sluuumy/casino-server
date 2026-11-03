@@ -6,7 +6,7 @@ const path = require('path');
 const { Server } = require('socket.io');
 
 const app = express();
-app.get('/', (req, res) => res.send('Cyber Casino : serveur en ligne'));
+app.get('/', (req, res) => res.send('Émeraude Club : serveur en ligne'));
 app.get('/health', (req, res) => res.json({ ok: true, round: round ? round.id : null, loto: loto ? loto.id : null }));
 
 const server = http.createServer(app);
@@ -350,6 +350,39 @@ if (!loto) newLoto(0);
 setInterval(() => { if (Date.now() >= loto.drawAt) runDraw(); }, 10000);
 
 /* ===================================================================
+   DUELS : deux joueurs misent la même somme, le serveur tire le gagnant
+   (50/50, aléatoire cryptographique) qui remporte la mise de l'autre.
+   =================================================================== */
+const DUEL_MIN = 1;
+const DUEL_MAX_OPEN = 3;              // défis ouverts au maximum par joueur
+const DUEL_TTL = 5 * 60 * 1000;       // un défi non accepté expire après 5 minutes
+const duels = new Map();              // id -> défi ouvert
+const duelResults = new Map();        // id -> résultat ou annulation, pour reprendre après rechargement
+const money2 = n => n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '\u00a0$';
+
+function duelList() {
+  return [...duels.values()].sort((a, b) => b.at - a.at).map(d => ({ id: d.id, from: d.from, to: d.toName || null, amount: d.amount, at: d.at }));
+}
+let duelTimer = null;
+function broadcastDuels() {
+  if (duelTimer) return;
+  duelTimer = setTimeout(() => { duelTimer = null; io.emit('duel_list', duelList()); }, 150);
+}
+function closeDuel(id, status) {
+  const d = duels.get(id);
+  if (!d) return;
+  duels.delete(id);
+  duelResults.set(id, { id, status, amount: d.amount });
+  io.to('u:' + d.fromKey).emit('duel_closed', { id, status, amount: d.amount });
+  broadcastDuels();
+}
+function keepResults() { while (duelResults.size > 3000) duelResults.delete(duelResults.keys().next().value); }
+setInterval(() => {
+  const now = Date.now();
+  for (const d of [...duels.values()]) if (now - d.at > DUEL_TTL) closeDuel(d.id, 'expired');
+}, 15000);
+
+/* ===================================================================
    CONNEXIONS
    =================================================================== */
 io.on('connection', socket => {
@@ -358,6 +391,7 @@ io.on('connection', socket => {
   socket.emit('race_state', publicRace());
   socket.emit('big_wins', bigWins);
   socket.emit('top_hour', topHour());
+  socket.emit('duel_list', duelList());
   socket.emit('race_bets', raceBetList());
   socket.emit('loto_state', lotoPublic());
   socket.emit('update_online_list', onlineList());
@@ -540,6 +574,67 @@ io.on('connection', socket => {
     ack(results.get(`${roundId}:${key}`) || { status: 'unknown' });
   });
 
+  /* ----- Duels ----- */
+  socket.on('duel_create', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant de lancer un duel.' });
+    if (!allow(socket, 'duel', 1500)) return ack({ ok: false, msg: 'Attendez un instant entre deux défis.' });
+    const amount = round2(data && data.amount), key = lower(u.username);
+    if (!Number.isFinite(amount) || amount < DUEL_MIN) return ack({ ok: false, msg: `Mise minimum : ${DUEL_MIN} $.` });
+    if (amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    if ([...duels.values()].filter(d => d.fromKey === key).length >= DUEL_MAX_OPEN) return ack({ ok: false, msg: `${DUEL_MAX_OPEN} défis ouverts au maximum.` });
+    let toKey = null, toName = null;
+    const target = clean(data && data.target, 24);
+    if (target) {
+      const ids = socketIdsOf(target);
+      if (!ids.length) return ack({ ok: false, msg: `${target} n’est pas connecté.` });
+      if (lower(target) === key) return ack({ ok: false, msg: 'Vous ne pouvez pas vous défier vous-même.' });
+      toKey = lower(target); toName = users[ids[0]].username;
+    }
+    const d = { id: crypto.randomBytes(6).toString('hex'), from: u.username, fromKey: key, toKey, toName, amount, at: Date.now() };
+    duels.set(d.id, d);
+    u.balance = round2(u.balance - amount);
+    broadcastDuels();
+    if (toKey) io.to('u:' + toKey).emit('duel_invite', { id: d.id, from: d.from, amount });
+    ack({ ok: true, id: d.id, amount });
+  });
+
+  socket.on('duel_cancel', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id], d = duels.get(clean(data && data.id, 20));
+    if (!u || !d || d.fromKey !== lower(u.username)) return ack({ ok: false, msg: 'Ce défi n’est plus ouvert.' });
+    closeDuel(d.id, 'cancelled');
+    ack({ ok: true, amount: d.amount });
+  });
+
+  socket.on('duel_accept', (data, ack) => {
+    ack = reply(ack);
+    const u = users[socket.id];
+    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant d’accepter un duel.' });
+    const d = duels.get(clean(data && data.id, 20)), key = lower(u.username);
+    if (!d) return ack({ ok: false, msg: 'Ce duel n’est plus disponible.' });
+    if (d.fromKey === key) return ack({ ok: false, msg: 'Vous ne pouvez pas accepter votre propre défi.' });
+    if (d.toKey && d.toKey !== key) return ack({ ok: false, msg: `Ce duel est réservé à ${d.toName}.` });
+    if (d.amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant pour relever ce défi.' });
+    if (!socketIdsOf(d.from).length) { closeDuel(d.id, 'cancelled'); return ack({ ok: false, msg: `${d.from} n’est plus connecté : duel annulé.` }); }
+    duels.delete(d.id); // retiré tout de suite : personne d'autre ne peut l'accepter
+    const creatorWins = crypto.randomInt(0, 2) === 0;
+    const r = { id: d.id, status: 'done', a: d.from, b: u.username, winner: creatorWins ? d.from : u.username, loser: creatorWins ? u.username : d.from, amount: d.amount, at: Date.now() };
+    duelResults.set(d.id, r); keepResults();
+    u.balance = round2(u.balance - d.amount);
+    ack({ ok: true, ...r });
+    io.to('u:' + d.fromKey).to('u:' + key).emit('duel_result', r);
+    io.emit('chat_message', { system: true, text: `Duel : ${r.winner} bat ${r.loser} et remporte ${money2(r.amount * 2)}.` });
+    broadcastDuels();
+  });
+
+  socket.on('duel_status', (data, ack) => {
+    ack = reply(ack);
+    const ids = Array.isArray(data && data.ids) ? data.ids.slice(0, 20).map(x => clean(x, 20)) : [];
+    ack({ ok: true, list: ids.map(id => duels.has(id) ? { id, status: 'open' } : duelResults.get(id) || { id, status: 'unknown' }) });
+  });
+
   /* ----- Loto quotidien ----- */
   socket.on('loto_buy', (data, ack) => {
     ack = reply(ack);
@@ -616,7 +711,11 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
+    const gone = users[socket.id];
     delete users[socket.id];
+    if (gone && !socketIdsOf(gone.username).length) {
+      for (const d of [...duels.values()]) if (d.fromKey === lower(gone.username)) closeDuel(d.id, 'cancelled');
+    }
     broadcastList();
     // Les mises en cours restent actives : l'encaissement automatique fonctionne même hors ligne.
   });
