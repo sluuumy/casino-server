@@ -58,7 +58,26 @@ const SABOTAGES = { halve: { price: 100000 }, clicker: { price: 125000 }, noboos
 const SABOTAGE_MAX = 3;                    // handicaps reçus au maximum par un même joueur…
 const SABOTAGE_WINDOW_MS = 10 * 60 * 1000; // …sur 10 minutes
 const sabotageLog = new Map();
-const bigWins = [];                       // dernières grosses victoires, pour les nouveaux arrivants             // pseudo visé -> dates des handicaps reçus
+const bigWins = [];
+const plinkoBig = [];                      // (ancienne version du site, plus utilisé)
+const hourWins = [];                       // gains de la dernière heure, tous jeux et tous joueurs
+const HOUR_MS = 3600 * 1000;
+let lastTopJson = '';
+function topHour() {
+  const since = Date.now() - HOUR_MS;
+  while (hourWins.length && hourWins[0].at < since) hourWins.shift(); // la liste est dans l'ordre d'arrivée
+  return hourWins.slice().sort((a, b) => b.amount - a.amount).slice(0, 10);
+}
+let topTimer = null;
+function broadcastTop(force) {
+  if (topTimer) return;
+  topTimer = setTimeout(() => {
+    topTimer = null;
+    const top = topHour(), json = JSON.stringify(top);
+    if (force || json !== lastTopJson) { lastTopJson = json; io.emit('top_hour', top); }
+  }, 800);
+}
+setInterval(() => broadcastTop(false), 60 * 1000); // les gains de plus d'une heure sortent du classement                       // dernières grosses victoires, pour les nouveaux arrivants             // pseudo visé -> dates des handicaps reçus
 
 /* ===================================================================
    AVIATEUR PARTAGÉ
@@ -338,6 +357,7 @@ io.on('connection', socket => {
   socket.emit('crash_bets', betList());
   socket.emit('race_state', publicRace());
   socket.emit('big_wins', bigWins);
+  socket.emit('top_hour', topHour());
   socket.emit('race_bets', raceBetList());
   socket.emit('loto_state', lotoPublic());
   socket.emit('update_online_list', onlineList());
@@ -430,6 +450,29 @@ io.on('connection', socket => {
     bigWins.unshift(win);
     bigWins.length = Math.min(bigWins.length, 10);
     io.emit('big_win', win);
+  });
+
+  /* ----- Gains de la dernière heure (top 10 de l'accueil) ----- */
+  socket.on('game_win', data => {
+    const u = users[socket.id];
+    if (!u || !allow(socket, 'gamewin', 120)) return;
+    const amount = round2(data && data.amount), mult = Math.round(Number(data && data.mult) * 100) / 100;
+    if (!(amount > 0 && amount < 1e13)) return;
+    hourWins.push({ username: u.username, game: clean(data.game, 24), amount, mult: Number.isFinite(mult) ? mult : 0, at: Date.now() });
+    if (hourWins.length > 20000) hourWins.splice(0, hourWins.length - 20000);
+    broadcastTop(false);
+  });
+
+  /* ----- Gros multiplicateurs du Plinko, partagés ----- */
+  socket.on('plinko_big', data => {
+    const u = users[socket.id];
+    if (!u || !allow(socket, 'plinkobig', 300)) return;
+    const mult = Number(data && data.mult), rows = Number(data && data.rows), risk = clean(data && data.risk, 10);
+    if (!(mult >= 10 && mult <= 1000) || ![8, 12, 16].includes(rows) || !['faible', 'moyen', 'eleve'].includes(risk)) return;
+    const hit = { username: u.username, mult, rows, risk, bet: round2(data.bet), win: round2(data.win), at: Date.now() };
+    plinkoBig.unshift(hit);
+    plinkoBig.length = Math.min(plinkoBig.length, 20);
+    io.emit('plinko_big', hit);
   });
 
   socket.on('place_bet', data => {
