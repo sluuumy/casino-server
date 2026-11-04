@@ -6,8 +6,8 @@ const path = require('path');
 const { Server } = require('socket.io');
 
 const app = express();
-app.get('/', (req, res) => res.send('Émeraude Club : serveur en ligne'));
-app.get('/health', (req, res) => res.json({ ok: true, round: round ? round.id : null, loto: loto ? loto.id : null }));
+app.get('/', (req, res) => res.send('Carat : serveur en ligne'));
+app.get('/health', (req, res) => res.json({ ok: true, round: round ? round.id : null, loto: loto ? loto.id : null, season: season ? season.num : null }));
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -383,6 +383,206 @@ setInterval(() => {
 }, 15000);
 
 /* ===================================================================
+   COMPTES EN LIGNE
+   Pseudo, mot de passe (haché avec scrypt) et progression complète.
+   Stockage : MongoDB Atlas si la variable MONGODB_URI est définie (recommandé,
+   permanent), sinon un fichier accounts.json (pratique pour tester, mais effacé
+   par Render gratuit à chaque mise en veille).
+   =================================================================== */
+const NAME_RE = /^[\p{L}\p{N}_.\-]{3,16}$/u;
+const MAX_STATE_BYTES = 400 * 1024;
+const accounts = new Map();             // pseudo en minuscules -> compte (cache)
+let mongo = null;                       // collection MongoDB si configurée
+let mongoDb = null;
+const ACCOUNTS_FILE = path.join(__dirname, 'accounts.json');
+
+async function initAccounts() {
+  if (process.env.MONGODB_URI) {
+    try {
+      const { MongoClient } = require('mongodb');
+      const client = new MongoClient(process.env.MONGODB_URI);
+      await client.connect();
+      mongoDb = client.db(process.env.MONGODB_DB || 'emeraude');
+      mongo = mongoDb.collection('accounts');
+      console.log('Comptes : MongoDB connecté');
+      return;
+    } catch (e) { console.error('MongoDB indisponible, repli sur le fichier :', e.message); mongo = null; }
+  }
+  try {
+    const saved = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'));
+    for (const a of saved) accounts.set(a._id, a);
+  } catch {}
+  console.log(`Comptes : fichier local (${accounts.size} comptes). Définissez MONGODB_URI pour un stockage permanent.`);
+}
+async function getAccount(key) {
+  if (accounts.has(key)) return accounts.get(key);
+  if (!mongo) return null;
+  const a = await mongo.findOne({ _id: key });
+  if (a) accounts.set(key, a);
+  return a;
+}
+// Écriture au plus une fois par seconde, mais toujours effectuée : un joueur qui joue sans arrêt
+// ne doit pas repousser indéfiniment la sauvegarde.
+const dirty = new Set();
+let flushTimer = null;
+function persist(a) {
+  accounts.set(a._id, a);
+  dirty.add(a._id);
+  if (!flushTimer) flushTimer = setTimeout(flushAccounts, 1000);
+}
+function removeAccount(key) { // supprime un compte (invité transformé, ou invité inactif)
+  accounts.delete(key);
+  dirty.delete(key);
+  if (mongo) mongo.deleteOne({ _id: key }).catch(e => console.error('Suppression impossible :', e.message));
+  else { if (!flushTimer) flushTimer = setTimeout(flushAccounts, 1000); }
+}
+async function flushAccounts() {
+  flushTimer = null;
+  const ids = [...dirty];
+  dirty.clear();
+  if (!ids.length && mongo) return;
+  if (mongo) {
+    await Promise.all(ids.map(id => mongo.replaceOne({ _id: id }, accounts.get(id), { upsert: true })
+      .catch(e => { console.error('Sauvegarde du compte impossible :', e.message); dirty.add(id); })));
+    if (dirty.size && !flushTimer) flushTimer = setTimeout(flushAccounts, 5000); // nouvel essai
+  } else {
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify([...accounts.values()]));
+  }
+}
+// Render arrête le serveur avec SIGTERM (mise en veille, redéploiement) : on enregistre tout avant de partir
+['SIGTERM', 'SIGINT'].forEach(sig => process.on(sig, async () => {
+  clearTimeout(flushTimer);
+  try { await flushAccounts(); } catch {}
+  process.exit(0);
+}));
+const scryptHash = (pw, salt) => new Promise((res, rej) => crypto.scrypt(String(pw), salt, 32, (e, k) => (e ? rej(e) : res(k.toString('hex')))));
+const tokenHash = t => sha256('tok:' + t);
+function newToken(a) {
+  const t = crypto.randomBytes(32).toString('hex');
+  a.tokens = (a.tokens || []).filter(x => Date.now() - x.at < 90 * 24 * 3600 * 1000).slice(-4); // 5 appareils retenus au maximum, 90 jours
+  a.tokens.push({ t: tokenHash(t), at: Date.now() });
+  return t;
+}
+function cleanState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return null;
+  const json = JSON.stringify(state);
+  return json.length <= MAX_STATE_BYTES ? JSON.parse(json) : null;
+}
+const loginFails = new Map(); // pseudo -> tentatives ratées récentes (anti force brute)
+function tooManyFails(key) {
+  const l = (loginFails.get(key) || []).filter(t => Date.now() - t < 10 * 60 * 1000);
+  loginFails.set(key, l);
+  return l.length >= 8;
+}
+/* Associe la connexion au compte ; les autres appareils ouverts sur ce compte sont déconnectés */
+function bindAccount(socket, a) {
+  socket.data.account = a._id;
+  socket.data.active = true;
+  for (const [id, s] of io.of('/').sockets) {
+    if (id !== socket.id && s.data.account === a._id && s.data.active) {
+      s.data.active = false;
+      s.emit('session_replaced');
+    }
+  }
+}
+function publicAccount(a, token) {
+  // une progression d'une saison passée n'est jamais renvoyée
+  if (a.state && season && Number(a.state.season) !== season.num) { a.state = null; persist(a); }
+  return { ok: true, username: a.username, token, state: a.state || null, savedAt: a.savedAt || 0, heritage: a.heritage || [], season: season ? season.num : 0, guest: !!a.guest };
+}
+
+/* ===================================================================
+   SAISONS (configuration dans saisons.js)
+   À la fin d'une saison : classement final archivé dans le Panthéon,
+   titres d'Héritage attribués, puis remise à zéro de tous les comptes.
+   =================================================================== */
+const Seasons = require('./saisons');
+const SEASON_FILE = path.join(__dirname, 'season.json');
+let metaCol = null;      // collection MongoDB « meta » si configurée
+let season = null;       // { num, startAt, endAt }
+let hall = [];           // Panthéon : une entrée par saison terminée
+
+function seasonEnd(startAt) { // un mois plus tard, à minuit heure de Paris
+  if (process.env.SEASON_TEST_MS) return startAt + Number(process.env.SEASON_TEST_MS); // pour les tests uniquement
+  const l = new Date(startAt + parisOffsetMs(new Date(startAt)));
+  const guess = Date.UTC(l.getUTCFullYear(), l.getUTCMonth() + 1, Math.min(l.getUTCDate(), 28));
+  return guess - parisOffsetMs(new Date(guess));
+}
+function publicSeason() {
+  return season && { num: season.num, startAt: season.startAt, endAt: season.endAt, config: Seasons.seasonConfig(season.num), hall: hall.slice(0, 12), serverNow: Date.now() };
+}
+async function saveMeta() {
+  const doc = { _id: 'season', season, hall };
+  if (metaCol) await metaCol.replaceOne({ _id: 'season' }, doc, { upsert: true });
+  else fs.writeFileSync(SEASON_FILE, JSON.stringify(doc));
+}
+async function allAccounts() {
+  if (mongo) { const list = await mongo.find({}).toArray(); list.forEach(a => { if (!accounts.has(a._id)) accounts.set(a._id, a); }); }
+  return [...accounts.values()];
+}
+const levelOf = state => Seasons.levelFromXp(Number(state && state.xp) || 0);
+function addHeritage(a, tag, label, num, id) {
+  a.heritage = a.heritage || [];
+  if (!a.heritage.some(h => h.id === id)) a.heritage.push({ id, tag, label, season: num, at: Date.now() });
+}
+/* Clôture une saison (ou la bêta, num = 0) : classement, titres, remise à zéro */
+async function closeSeason(num, name) {
+  const all = await allAccounts();
+  const players = all.filter(a => a.state && (num === 0 || Number(a.state.season) === num) && (Number(a.state.gamesPlayed) > 0 || Number(a.state.totalClicks) > 0));
+  const ranked = players.slice().sort((x, y) => (Number(y.state.balance) || 0) - (Number(x.state.balance) || 0));
+  const short = num === 0 ? 'BÊTA' : `S${num}`, long = num === 0 ? 'de la bêta' : `de la saison ${num}`;
+  ranked.forEach((a, i) => {
+    if (num === 0) addHeritage(a, 'PIONNIER BÊTA', 'Pionnier de la bêta', 0, 'beta');
+    else addHeritage(a, `JOUEUR ${short}`, `Joueur ${long}`, num, `s${num}-joueur`);
+    if (i === 0) addHeritage(a, `CHAMPION ${short}`, `Champion ${long}`, num, `s${num}-champion`);
+    else if (i < 3) addHeritage(a, `PODIUM ${short}`, `Podium ${long}`, num, `s${num}-podium`);
+    else if (i < 10) addHeritage(a, `TOP 10 ${short}`, `Top 10 ${long}`, num, `s${num}-top10`);
+    const lvl = levelOf(a.state);
+    if (lvl >= Seasons.MAX_LEVEL) addHeritage(a, `VÉTÉRAN ${short}`, `Niveau ${Seasons.MAX_LEVEL} ${long}`, num, `s${num}-veteran`);
+    else if (num > 0 && lvl >= Seasons.PRESTIGE_LEVEL) addHeritage(a, `PRESTIGE ${short}`, `Piste Prestige ${long}`, num, `s${num}-prestige`);
+  });
+  if (num === 0) all.forEach(a => addHeritage(a, 'PIONNIER BÊTA', 'Pionnier de la bêta', 0, 'beta')); // tous les comptes de la bêta
+  hall.unshift({ num, name, endedAt: Date.now(), players: players.length,
+    top: ranked.slice(0, 10).map(a => ({ username: a.username, balance: Math.round((Number(a.state.balance) || 0) * 100) / 100, level: levelOf(a.state) })) });
+  hall.length = Math.min(hall.length, 36);
+  const next = num + 1;
+  all.forEach(a => {
+    if (a.guest && Date.now() - (a.savedAt || a.created || 0) > 30 * 24 * 3600 * 1000) return removeAccount(a._id);
+    a.state = null; a.savedAt = Date.now(); a.season = next; persist(a);
+  });
+  return next;
+}
+async function initSeasons() {
+  try {
+    if (mongoDb) { metaCol = mongoDb.collection('meta'); const doc = await metaCol.findOne({ _id: 'season' }); if (doc) { season = doc.season; hall = doc.hall || []; } }
+    else { const doc = JSON.parse(fs.readFileSync(SEASON_FILE, 'utf8')); season = doc.season; hall = doc.hall || []; }
+  } catch {}
+  if (!season) { // première mise en ligne des saisons : la bêta se termine, la saison 1 commence
+    const next = await closeSeason(0, 'Bêta');
+    const now = Date.now();
+    season = { num: next, startAt: now, endAt: seasonEnd(now) };
+    await saveMeta();
+    console.log(`Saison ${season.num} lancée : fin le ${new Date(season.endAt).toLocaleString('fr-FR', { timeZone: 'Europe/Paris' })}`);
+  }
+  setInterval(checkSeason, process.env.SEASON_TEST_MS ? 2000 : 30000);
+  io.emit('season_info', publicSeason());
+}
+let rolling = false;
+async function checkSeason() {
+  if (!season || rolling || Date.now() < season.endAt) return;
+  rolling = true;
+  try {
+    const ended = season, cfg = Seasons.seasonConfig(ended.num);
+    const next = await closeSeason(ended.num, cfg.name);
+    season = { num: next, startAt: ended.endAt, endAt: seasonEnd(Math.max(ended.endAt, Date.now())) };
+    await saveMeta();
+    console.log(`Saison ${ended.num} terminée, saison ${season.num} lancée`);
+    io.emit('season_changed', publicSeason());
+  } catch (e) { console.error('Changement de saison impossible :', e.message); }
+  rolling = false;
+}
+
+/* ===================================================================
    CONNEXIONS
    =================================================================== */
 io.on('connection', socket => {
@@ -392,6 +592,7 @@ io.on('connection', socket => {
   socket.emit('big_wins', bigWins);
   socket.emit('top_hour', topHour());
   socket.emit('duel_list', duelList());
+  if (season) socket.emit('season_info', publicSeason());
   socket.emit('race_bets', raceBetList());
   socket.emit('loto_state', lotoPublic());
   socket.emit('update_online_list', onlineList());
@@ -399,8 +600,9 @@ io.on('connection', socket => {
   socket.on('time_sync', (_, ack) => reply(ack)(Date.now()));
 
   socket.on('user_join', data => {
-    const username = clean(data && data.username, 24);
-    if (!username) return;
+    const acct = socket.data.account && socket.data.active ? accounts.get(socket.data.account) : null;
+    const username = acct ? acct.username : clean(data && data.username, 24);
+    if (!acct) return; // tous les joueurs ont un compte sur le serveur (même les invités)
     const prev = users[socket.id];
     if (prev && lower(prev.username) !== lower(username)) socket.leave('u:' + lower(prev.username));
     users[socket.id] = {
@@ -574,6 +776,129 @@ io.on('connection', socket => {
     ack(results.get(`${roundId}:${key}`) || { status: 'unknown' });
   });
 
+  /* ----- Comptes ----- */
+  socket.on('account_register', async (data, ack) => {
+    ack = reply(ack);
+    if (!allow(socket, 'register', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
+    const username = String((data && data.username) || '').replace(/\s+/g, ' ').trim(), pw = String((data && data.password) || '');
+    if (!NAME_RE.test(username)) return ack({ ok: false, msg: 'Pseudo invalide : 3 à 16 lettres, chiffres, point, tiret ou tiret bas.' });
+    if (/^invit/i.test(username)) return ack({ ok: false, msg: 'Les pseudos commençant par « Invité » sont réservés.' });
+    if (pw.length < 6 || pw.length > 200) return ack({ ok: false, msg: 'Mot de passe : 6 caractères minimum.' });
+    const key = lower(username);
+    if (await getAccount(key)) return ack({ ok: false, code: 'taken', msg: 'Ce pseudo est déjà pris.' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    if (!season) return ack({ ok: false, msg: 'Le serveur démarre : réessayez dans quelques secondes.' });
+    let state = cleanState(data && data.state);
+    if (state && Number(state.season) !== season.num) state = null; // progression d'une autre saison : on repart de zéro
+    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state, savedAt: state ? Number(state.savedAt) || Date.now() : 0,
+      created: Date.now(), imported: !!(data && data.imported), tokens: [], heritage: [], season: season.num };
+    if (a.imported) addHeritage(a, 'PIONNIER BÊTA', 'Pionnier de la bêta', 0, 'beta');
+    const token = newToken(a);
+    persist(a);
+    bindAccount(socket, a);
+    ack(publicAccount(a, token));
+  });
+
+  socket.on('account_login', async (data, ack) => {
+    ack = reply(ack);
+    if (!allow(socket, 'auth', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
+    const key = lower(String((data && data.username) || '').trim()), pw = String((data && data.password) || '');
+    if (tooManyFails(key)) return ack({ ok: false, msg: 'Trop de tentatives : réessayez dans quelques minutes.' });
+    const a = await getAccount(key);
+    if (!a) return ack({ ok: false, code: 'not_found', msg: 'Pseudo ou mot de passe incorrect.' });
+    if (a.guest || await scryptHash(pw, a.salt) !== a.hash) { loginFails.get(key).push(Date.now()); return ack({ ok: false, msg: 'Pseudo ou mot de passe incorrect.' }); }
+    const token = newToken(a);
+    persist(a);
+    bindAccount(socket, a);
+    ack(publicAccount(a, token));
+  });
+
+  socket.on('account_resume', async (data, ack) => { // reconnexion automatique avec le jeton de l'appareil
+    ack = reply(ack);
+    const key = lower(String((data && data.username) || '')), t = String((data && data.token) || '');
+    const a = key && t ? await getAccount(key) : null;
+    if (!a || !(a.tokens || []).some(x => x.t === tokenHash(t))) return ack({ ok: false, code: 'invalid', msg: 'Session expirée : reconnectez-vous.' });
+    bindAccount(socket, a);
+    ack(publicAccount(a, t));
+  });
+
+  socket.on('account_save', (data, ack) => {
+    ack = reply(ack);
+    const a = socket.data.account && accounts.get(socket.data.account);
+    if (!a) return ack({ ok: false, code: 'auth' });
+    if (!socket.data.active) return ack({ ok: false, code: 'replaced' });
+    const state = cleanState(data && data.state);
+    if (!state) return ack({ ok: false, msg: 'Sauvegarde trop volumineuse ou invalide.' });
+    if (season && Number(state.season) !== season.num) return ack({ ok: false, code: 'season' }); // partie d'une saison terminée
+    a.state = state;
+    a.savedAt = Number(state.savedAt) || Date.now();
+    persist(a);
+    ack({ ok: true, savedAt: a.savedAt });
+  });
+
+  socket.on('account_logout', (data, ack) => {
+    ack = reply(ack);
+    const a = socket.data.account && accounts.get(socket.data.account), t = String((data && data.token) || '');
+    if (a && t) { a.tokens = (a.tokens || []).filter(x => x.t !== tokenHash(t)); persist(a); }
+    socket.data.account = null; socket.data.active = false;
+    ack({ ok: true });
+  });
+
+  socket.on('account_password', async (data, ack) => {
+    ack = reply(ack);
+    const a = socket.data.account && accounts.get(socket.data.account);
+    if (!a || !socket.data.active) return ack({ ok: false, msg: 'Connectez-vous d’abord.' });
+    if (!allow(socket, 'auth', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
+    if (await scryptHash(String((data && data.old) || ''), a.salt) !== a.hash) return ack({ ok: false, msg: 'Mot de passe actuel incorrect.' });
+    const pw = String((data && data.password) || '');
+    if (pw.length < 6 || pw.length > 200) return ack({ ok: false, msg: 'Nouveau mot de passe : 6 caractères minimum.' });
+    a.salt = crypto.randomBytes(16).toString('hex');
+    a.hash = await scryptHash(pw, a.salt);
+    const token = newToken(a); a.tokens = a.tokens.slice(-1); // les autres appareils devront se reconnecter
+    persist(a);
+    ack({ ok: true, token });
+  });
+
+  /* ----- Invités : comptes temporaires sur le serveur, transformables en vrais comptes ----- */
+  socket.on('account_guest', async (data, ack) => {
+    ack = reply(ack);
+    if (!allow(socket, 'register', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
+    if (!season) return ack({ ok: false, msg: 'Le serveur démarre : réessayez dans quelques secondes.' });
+    let username = '', key = '';
+    for (let i = 0; i < 20; i++) {
+      username = 'Invité_' + crypto.randomInt(100000, 1000000);
+      key = lower(username);
+      if (!(await getAccount(key))) break;
+    }
+    const a = { _id: key, username, guest: true, salt: '', hash: '', state: null, savedAt: 0, created: Date.now(), tokens: [], heritage: [], season: season.num };
+    const token = newToken(a);
+    persist(a);
+    bindAccount(socket, a);
+    ack(publicAccount(a, token));
+  });
+
+  socket.on('account_claim', async (data, ack) => { // un invité choisit un pseudo et un mot de passe : sa partie est conservée
+    ack = reply(ack);
+    const g = socket.data.account && accounts.get(socket.data.account);
+    if (!g || !g.guest || !socket.data.active) return ack({ ok: false, msg: 'Aucune partie invité à transférer.' });
+    if (!allow(socket, 'register', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
+    const username = String((data && data.username) || '').replace(/\s+/g, ' ').trim(), pw = String((data && data.password) || '');
+    if (!NAME_RE.test(username)) return ack({ ok: false, msg: 'Pseudo invalide : 3 à 16 lettres, chiffres, point, tiret ou tiret bas.' });
+    if (/^invit/i.test(username)) return ack({ ok: false, msg: 'Les pseudos commençant par « Invité » sont réservés.' });
+    if (pw.length < 6 || pw.length > 200) return ack({ ok: false, msg: 'Mot de passe : 6 caractères minimum.' });
+    const key = lower(username);
+    if (await getAccount(key)) return ack({ ok: false, code: 'taken', msg: 'Ce pseudo est déjà pris.' });
+    const salt = crypto.randomBytes(16).toString('hex');
+    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state: g.state, savedAt: g.savedAt, created: Date.now(), tokens: [], heritage: g.heritage || [], season: g.season };
+    const token = newToken(a);
+    persist(a);
+    removeAccount(g._id);
+    bindAccount(socket, a);
+    const u = users[socket.id];
+    if (u) { socket.leave('u:' + lower(u.username)); delete users[socket.id]; broadcastList(); }
+    ack(publicAccount(a, token));
+  });
+
   /* ----- Duels ----- */
   socket.on('duel_create', (data, ack) => {
     ack = reply(ack);
@@ -723,6 +1048,7 @@ io.on('connection', socket => {
 
 startBetting();
 startRaceBetting();
+initAccounts().then(initSeasons);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Serveur en écoute sur le port ${PORT}`));
