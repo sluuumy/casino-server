@@ -128,8 +128,10 @@ function seasonConfig(n) {
   return { ...base, num: n, prestigeLevel: PRESTIGE_LEVEL, maxLevel: MAX_LEVEL };
 }
 
-/* Niveaux : XP totale nécessaire pour atteindre le niveau L (même formule sur le site) */
-const xpForLevel = L => (L <= 1 ? 0 : Math.round(25 * Math.pow(L, 1.65)));
+/* Niveaux : XP totale nécessaire pour atteindre le niveau L (même formule sur le site).
+   Chaque niveau coûte plus cher que le précédent : 150 XP pour le niveau 2, puis 150 + 40k + 3k²
+   (k = niveau actuel - 1). Total : 16 017 XP pour le niveau 20, 168 462 XP pour le niveau 50. */
+const xpForLevel = L => { if (L <= 1) return 0; const n = L - 1; return 150 * n + 20 * n * (n - 1) + (n - 1) * n * (2 * n - 1) / 2; };
 const levelFromXp = xp => { let L = 1; while (L < MAX_LEVEL && xp >= xpForLevel(L + 1)) L++; return L; };
 
 module.exports = { SEASONS, seasonConfig, xpForLevel, levelFromXp, PRESTIGE_LEVEL, MAX_LEVEL };
