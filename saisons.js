@@ -134,4 +134,22 @@ function seasonConfig(n) {
 const xpForLevel = L => { if (L <= 1) return 0; const n = L - 1; return 150 * n + 20 * n * (n - 1) + (n - 1) * n * (2 * n - 1) / 2; };
 const levelFromXp = xp => { let L = 1; while (L < MAX_LEVEL && xp >= xpForLevel(L + 1)) L++; return L; };
 
-module.exports = { SEASONS, seasonConfig, xpForLevel, levelFromXp, PRESTIGE_LEVEL, MAX_LEVEL };
+/* Version du pass : l'augmenter remet le pass de tous les joueurs à zéro
+   (XP, paliers récupérés, boosts en réserve, gemmes, thèmes et titres du pass).
+   L'argent déjà reçu reste acquis. Même valeur que PASS_VERSION dans index.html. */
+const PASS_VERSION = 2;
+const PASS_THEMES = ['or_massif', 'banquise', 'magma'];
+function resetPassState(st) {
+  if (!st || typeof st !== 'object') return st;
+  const titles = Array.isArray(st.passTitles) ? st.passTitles : [];
+  st.xp = 0; st.xpDay = null; st.passClaimed = {}; st.passTitles = []; st.boostItems = {};
+  if (titles.includes(st.equippedBadge)) st.equippedBadge = '';
+  st.inventory = st.inventory && typeof st.inventory === 'object' ? st.inventory : {};
+  Object.keys(st.inventory).forEach(k => { if (k.startsWith('coin_') || PASS_THEMES.includes(k.replace('theme_', ''))) delete st.inventory[k]; });
+  st.coinSkin = 'or';
+  if (PASS_THEMES.includes(st.theme)) st.theme = 'tapis';
+  st.passVersion = PASS_VERSION;
+  return st;
+}
+
+module.exports = { SEASONS, seasonConfig, xpForLevel, levelFromXp, PRESTIGE_LEVEL, MAX_LEVEL, PASS_VERSION, resetPassState };
