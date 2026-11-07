@@ -564,8 +564,17 @@ async function initSeasons() {
     await saveMeta();
     console.log(`Saison ${season.num} lancée : fin le ${new Date(season.endAt).toLocaleString('fr-FR', { timeZone: 'Europe/Paris' })}`);
   }
+  await migratePass();
   setInterval(checkSeason, process.env.SEASON_TEST_MS ? 2000 : 30000);
   io.emit('season_info', publicSeason());
+}
+/* Nouvelle version du pass : remise à zéro du pass de tous les comptes, une seule fois */
+async function migratePass() {
+  let n = 0;
+  for (const a of await allAccounts()) {
+    if (a.state && Number(a.state.passVersion) !== Seasons.PASS_VERSION) { Seasons.resetPassState(a.state); persist(a); n++; }
+  }
+  if (n) console.log(`Pass de saison remis à zéro pour ${n} compte${n > 1 ? 's' : ''} (version ${Seasons.PASS_VERSION})`);
 }
 let rolling = false;
 async function checkSeason() {
@@ -830,6 +839,7 @@ io.on('connection', socket => {
     const state = cleanState(data && data.state);
     if (!state) return ack({ ok: false, msg: 'Sauvegarde trop volumineuse ou invalide.' });
     if (season && Number(state.season) !== season.num) return ack({ ok: false, code: 'season' }); // partie d'une saison terminée
+    if (Number(state.passVersion) !== Seasons.PASS_VERSION) Seasons.resetPassState(state); // site pas encore à jour : pas d'ancienne XP
     a.state = state;
     a.savedAt = Number(state.savedAt) || Date.now();
     persist(a);
@@ -1051,4 +1061,4 @@ startRaceBetting();
 initAccounts().then(initSeasons);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Serveur en écoute sur le port ${PORT}`));
+server.listen(PORT, () => console.log(`Serveur en écoute sur le port ${PORT}`))
