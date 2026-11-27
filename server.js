@@ -34,12 +34,16 @@ function allow(socket, key, ms) {
 /* ===================================================================
    JOUEURS CONNECTÉS
    =================================================================== */
-const users = {}; // socket.id -> { username, balance, badge }
+const users = {}; // socket.id -> { username, key } ; le solde et le titre viennent du compte, jamais du navigateur
 
 function onlineList() {
-  const byName = new Map();
-  for (const u of Object.values(users)) if (u.username) byName.set(lower(u.username), u);
-  return [...byName.values()];
+  const byKey = new Map();
+  for (const u of Object.values(users)) {
+    if (!u.key || byKey.has(u.key)) continue;
+    const a = accounts.get(u.key), st = a && a.state;
+    byKey.set(u.key, { username: u.username, balance: st ? st.balance : 0, badge: st ? st.equippedBadge || '' : '' });
+  }
+  return [...byKey.values()];
 }
 let listTimer = null;
 function broadcastList() {
@@ -163,7 +167,16 @@ function tick() {
 function cashout(bet, mult) {
   bet.cashedAt = mult;
   bet.payout = round2(bet.amount * mult);
-  io.to('u:' + lower(bet.username)).emit('crash_cashed', { roundId: round.id, mult, payout: bet.payout });
+  const a = accounts.get(bet.key);
+  if (a && a.state && a.state.season === bet.season) {
+    const st = a.state, ev = [];
+    if (mult > st.bestCrash) st.bestCrash = mult;
+    bet.payout = Eco.settle(st, ev, 'Aviateur', bet.amount, bet.payout, mult);
+    if (mult >= 2) Eco.bump(st, 'crash2', 1);
+    if (mult >= 5) Eco.bump(st, 'crash5', 1);
+    changed(a, ev);
+    io.to('u:' + bet.key).emit('crash_cashed', { roundId: round.id, mult, payout: bet.payout, st: Eco.snapshot(st) });
+  }
   broadcastBets();
 }
 
@@ -174,6 +187,8 @@ function endRound() {
     results.set(`${round.id}:${key}`, b.cashedAt != null
       ? { status: 'cashed', mult: b.cashedAt, payout: b.payout }
       : { status: 'lost', point: round.point });
+    const a = b.cashedAt == null && accounts.get(b.key);
+    if (a && a.state && a.state.season === b.season) { Eco.settle(a.state, [], 'Aviateur', b.amount, 0, round.point); changed(a, [], true); }
   }
   while (results.size > 5000) results.delete(results.keys().next().value);
   history.unshift({ id: round.id, point: round.point, seed: round.seed, hash: round.hash });
@@ -250,8 +265,18 @@ function startRaceRun() {
 function endRace() {
   race.phase = 'finished';
   for (const [key, b] of race.bets) {
-    const won = b.horse === race.winner;
-    raceResults.set(`${race.id}:${key}`, { status: won ? 'won' : 'lost', horse: b.horse, amount: b.amount, odds: race.odds[b.horse], payout: won ? Math.round(b.amount * race.odds[b.horse] * 100) / 100 : 0, winner: race.winner });
+    const won = b.horse === race.winner, odds = race.odds[b.horse];
+    let payout = won ? Math.round(b.amount * odds * 100) / 100 : 0;
+    const a = accounts.get(b.key);
+    if (a && a.state && a.state.season === b.season) {
+      const st = a.state, ev = [];
+      if (won && odds >= 9 && Eco.counts(b.amount)) st.c.outsider++;
+      if (Eco.counts(b.amount)) Eco.bump(st, 'races', 1);
+      payout = Eco.settle(st, ev, 'Course', b.amount, payout, won ? odds : 0);
+      changed(a, ev);
+      io.to('u:' + b.key).emit('race_mine', { raceId: race.id, won, payout, horse: b.horse, amount: b.amount, st: Eco.snapshot(st) });
+    }
+    raceResults.set(`${race.id}:${key}`, { status: won ? 'won' : 'lost', horse: b.horse, amount: b.amount, odds, payout, winner: race.winner });
   }
   while (raceResults.size > 5000) raceResults.delete(raceResults.keys().next().value);
   raceHistory.unshift(race.winner);
@@ -334,6 +359,7 @@ function runDraw() {
     winners.push({ rank: i + 1, username: loto.tickets[key].username, amount });
   });
   lotoClaims[loto.id] = results;
+  payLotoWinners(loto.id, results);
   const ids = Object.keys(lotoClaims).sort();
   while (ids.length > 14) delete lotoClaims[ids.shift()];
   lotoLast = { id: loto.id, pot, tickets: entries.length, winners };
@@ -373,7 +399,9 @@ function closeDuel(id, status) {
   if (!d) return;
   duels.delete(id);
   duelResults.set(id, { id, status, amount: d.amount });
-  io.to('u:' + d.fromKey).emit('duel_closed', { id, status, amount: d.amount });
+  const a = accounts.get(d.fromKey);
+  if (a && a.state && a.state.season === d.season) { Eco.credit(a.state, d.amount); changed(a, []); }
+  io.to('u:' + d.fromKey).emit('duel_closed', { id, status, amount: d.amount, st: a && a.state ? Eco.snapshot(a.state) : null });
   broadcastDuels();
 }
 function keepResults() { while (duelResults.size > 3000) duelResults.delete(duelResults.keys().next().value); }
@@ -476,19 +504,110 @@ function tooManyFails(key) {
 }
 /* Associe la connexion au compte ; les autres appareils ouverts sur ce compte sont déconnectés */
 function bindAccount(socket, a) {
+  if (socket.data.account && socket.data.account !== a._id) { socket.leave('u:' + socket.data.account); delete users[socket.id]; }
   socket.data.account = a._id;
   socket.data.active = true;
   for (const [id, s] of io.of('/').sockets) {
     if (id !== socket.id && s.data.account === a._id && s.data.active) {
       s.data.active = false;
+      s.leave('u:' + a._id);
+      delete users[id];
       s.emit('session_replaced');
     }
   }
+  socket.join('u:' + a._id);
+  users[socket.id] = { username: a.username, key: a._id };
+  const session = openSession(a);
+  broadcastList();
+  return session;
 }
-function publicAccount(a, token) {
-  // une progression d'une saison passée n'est jamais renvoyée
-  if (a.state && season && Number(a.state.season) !== season.num) { a.state = null; persist(a); }
-  return { ok: true, username: a.username, token, state: a.state || null, savedAt: a.savedAt || 0, heritage: a.heritage || [], season: season ? season.num : 0, guest: !!a.guest };
+/* ===================================================================
+   ÉCONOMIE : le serveur est le seul à modifier les soldes (economie.js)
+   =================================================================== */
+const ECO_VERSION = 1;                 // remise en forme des anciennes progressions, venues du navigateur
+const startBalance = () => { const c = season && Seasons.seasonConfig(season.num); return (c && c.rules && c.rules.startBalance) || 150; };
+function ensureState(a) {
+  if (!season) return null;
+  if (!a.state || Number(a.state.season) !== season.num) {
+    a.state = Eco.newState(startBalance()); a.priv = {}; a.eco = ECO_VERSION; a.notes = [];
+  } else if (a.eco !== ECO_VERSION) {
+    a.state = Eco.normalize(a.state, startBalance()); a.priv = {}; a.eco = ECO_VERSION;
+  }
+  a.state.season = season.num;
+  if (Number(a.state.passVersion) !== Seasons.PASS_VERSION) Seasons.resetPassState(a.state);
+  a.priv = a.priv || {};
+  Eco.ensureDay(a.state);
+  return a.state;
+}
+/* Après chaque changement d'un compte : enregistrement, annonces, liste des joueurs */
+function changed(a, ev, sendState) {
+  Eco.touch(a.state);
+  persist(a);
+  for (const e of ev || []) {
+    if (e.type === 'bet') io.emit('live_bet', { username: a.username, game: e.game, amount: e.amount });
+    if (e.type === 'win') {
+      hourWins.push({ username: a.username, game: e.game, amount: e.amount, mult: e.mult, at: Date.now() });
+      if (hourWins.length > 20000) hourWins.splice(0, hourWins.length - 20000);
+      broadcastTop(false);
+      if (e.amount >= 500 && (e.mult >= 5 || e.amount >= 5000)) {
+        const win = { username: a.username, game: e.game, amount: e.amount, mult: e.mult, at: Date.now() };
+        bigWins.unshift(win); bigWins.length = Math.min(bigWins.length, 10);
+        io.emit('big_win', win);
+      }
+    }
+  }
+  if (sendState) io.to('u:' + a._id).emit('eco_state', { st: Eco.snapshot(a.state) });
+  broadcastList();
+}
+async function payLotoWinners(id, results) {
+  for (const [key, r] of Object.entries(results)) {
+    if (!(r.win > 0)) continue;
+    try {
+      const a = await getAccount(key);
+      if (!a || !a.state || !season || a.state.season !== season.num) continue;
+      Eco.credit(a.state, r.win); a.state.c.lotoWins++; r.claimed = true;
+      delete a.state.loto[id];
+      a.notes = (a.notes || []).concat(`Loto du ${id} : vous gagnez ${money2(r.win)} !`).slice(-10);
+      changed(a, [], true);
+      if (socketIdsOf(a.username).length) { io.to('u:' + key).emit('loto_win', { id, win: r.win }); a.notes = []; }
+    } catch (e) { console.error('Gain du loto non versé :', e.message); }
+  }
+  saveLoto();
+}
+/* Limite de créations de comptes par adresse (contre les comptes jetables) */
+const ipLog = new Map();
+function ipOf(socket) { return String(socket.handshake.headers['x-forwarded-for'] || socket.handshake.address || '').split(',')[0].trim(); }
+function ipAllowed(socket, kind, max) {
+  const k = kind + ':' + ipOf(socket), now = Date.now();
+  const l = (ipLog.get(k) || []).filter(t => now - t < 3600 * 1000);
+  if (l.length >= max) return false;
+  l.push(now); ipLog.set(k, l);
+  return true;
+}
+/* Mises en cours du joueur (Aviateur, Course), pour les réafficher après un rechargement */
+function liveInfo(a) {
+  const key = a._id, live = {};
+  const cb = round && round.bets.get(key);
+  if (cb) live.crash = { roundId: round.id, amount: cb.amount, auto: cb.auto, cashedAt: cb.cashedAt };
+  const rb = race && race.bets.get(key);
+  if (rb) live.race = { raceId: race.id, horse: rb.horse, amount: rb.amount, odds: race.odds[rb.horse] };
+  return live;
+}
+/* Ouverture d'une session : parties interrompues réglées, gains hors ligne versés */
+function openSession(a) {
+  const st = ensureState(a);
+  if (!st) return { notes: [] };
+  const ev = [], notes = Eco.resolveActive(st, a.priv, ev).concat(a.notes || []);
+  a.notes = [];
+  if (season) Object.keys(st.loto).forEach(id => { if (!loto || id !== loto.id) delete st.loto[id]; });
+  const gain = Eco.offline(st, a.priv);
+  changed(a, ev);
+  return { notes, offlineGain: gain };
+}
+function publicAccount(a, token, session) {
+  const st = ensureState(a);
+  return { ok: true, username: a.username, token, state: st ? Eco.snapshot(st) : null, heritage: a.heritage || [], season: season ? season.num : 0, guest: !!a.guest,
+    notes: (session && session.notes) || [], offlineGain: (session && session.offlineGain) || 0, live: liveInfo(a) };
 }
 
 /* ===================================================================
@@ -497,6 +616,8 @@ function publicAccount(a, token) {
    titres d'Héritage attribués, puis remise à zéro de tous les comptes.
    =================================================================== */
 const Seasons = require('./saisons');
+const Eco = require('./economie');
+Eco.setSeasonSource(() => (season ? Seasons.seasonConfig(season.num) : null));
 const SEASON_FILE = path.join(__dirname, 'season.json');
 let metaCol = null;      // collection MongoDB « meta » si configurée
 let season = null;       // { num, startAt, endAt }
@@ -606,164 +727,135 @@ io.on('connection', socket => {
   socket.emit('loto_state', lotoPublic());
   socket.emit('update_online_list', onlineList());
 
+  /* Compte actif de cette connexion (null si non connecté ou remplacé par un autre appareil) */
+  const acct = () => { const a = socket.data.account && socket.data.active ? accounts.get(socket.data.account) : null; return a && ensureState(a) ? a : null; };
+  const failMsg = (ack, e) => {
+    if (e instanceof Eco.Fail) return ack({ ok: false, msg: e.message });
+    console.error(e);
+    ack({ ok: false, msg: 'Erreur du serveur, réessayez.' });
+  };
+
   socket.on('time_sync', (_, ack) => reply(ack)(Date.now()));
 
-  socket.on('user_join', data => {
-    const acct = socket.data.account && socket.data.active ? accounts.get(socket.data.account) : null;
-    const username = acct ? acct.username : clean(data && data.username, 24);
-    if (!acct) return; // tous les joueurs ont un compte sur le serveur (même les invités)
-    const prev = users[socket.id];
-    if (prev && lower(prev.username) !== lower(username)) socket.leave('u:' + lower(prev.username));
-    users[socket.id] = {
-      username,
-      balance: Math.max(0, Number(data.balance) || 0),
-      badge: clean(data.badge, 20)
-    };
-    socket.join('u:' + lower(username));
-    broadcastList();
-  });
+  // Le site annonce sa présence : rien d'autre n'est lu (solde et titre viennent du compte)
+  socket.on('user_join', () => { const a = acct(); if (a) { users[socket.id] = { username: a.username, key: a._id }; socket.join('u:' + a._id); broadcastList(); } });
+  // Anciennes versions du site : ces messages ne sont plus écoutés (le solde n'est plus fourni par le navigateur)
+  ['update_balance', 'big_win', 'game_win', 'plinko_big', 'place_bet'].forEach(ev => socket.on(ev, () => {}));
 
-  socket.on('update_balance', data => {
-    const u = users[socket.id];
-    if (!u) return;
-    u.balance = Math.max(0, Number(data && data.balance) || 0);
-    u.badge = clean(data && data.badge, 20);
-    broadcastList();
-  });
+  /* ----- Toutes les actions de jeu et d'économie (economie.js) ----- */
+  const GAP = { clicks: 250, plinko_drop: 60, mines_pick: 40, taquin_move: 25, coin_play: 150, default: 120 };
+  for (const [name, fn] of Object.entries(Eco.ACTIONS)) {
+    socket.on(name, (data, ack) => {
+      ack = reply(ack);
+      const a = acct();
+      if (!a) return ack({ ok: false, code: 'auth', msg: 'Connectez-vous d’abord.' });
+      if (!allow(socket, 'act:' + name, GAP[name] || GAP.default)) return ack({ ok: false, msg: 'Doucement : une action à la fois.' });
+      const ev = [];
+      try {
+        const res = fn(a.state, a.priv, data && typeof data === 'object' ? data : {}, ev);
+        changed(a, ev);
+        const st = a.state;
+        // les clics arrivent souvent : on ne renvoie que ce qui change
+        const out = name === 'clicks' ? { rev: st.rev, balance: st.balance, totalClicks: st.totalClicks, clicker: st.clicker, daily: st.daily, xp: st.xp } : Eco.snapshot(st);
+        ack({ ok: true, ...res, st: out });
+      } catch (e) { failMsg(ack, e); }
+    });
+  }
 
   socket.on('send_message', data => {
-    const u = users[socket.id];
+    const a = acct();
     const text = clean(data && data.text, 200);
-    if (!u || !text || !allow(socket, 'chat', 700)) return;
-    io.emit('chat_message', { username: u.username, text, badge: u.badge });
+    if (!a || !text || !allow(socket, 'chat', 700)) return;
+    a.state.c.chats++;
+    io.emit('chat_message', { username: a.username, text, badge: a.state.equippedBadge || '' });
   });
 
   socket.on('send_money', (data, ack) => {
     ack = reply(ack);
-    const from = users[socket.id];
-    if (!from) return ack({ ok: false, msg: 'Connectez-vous avant d’envoyer de l’argent.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant d’envoyer de l’argent.' });
+    if (a.guest) return ack({ ok: false, msg: 'Créez un compte pour envoyer de l’argent.' });
     if (!allow(socket, 'money', 1500)) return ack({ ok: false, msg: 'Attendez un instant entre deux transferts.' });
     const amount = round2(data && data.amount);
     if (!Number.isFinite(amount) || amount < 1) return ack({ ok: false, msg: 'Montant minimum : 1,00 $.' });
-    if (amount > from.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
     const target = clean(data && data.targetUser, 24);
-    if (lower(target) === lower(from.username)) return ack({ ok: false, msg: 'Vous ne pouvez pas vous envoyer de l’argent à vous-même.' });
-    const ids = socketIdsOf(target);
-    if (!ids.length) return ack({ ok: false, msg: `${target} n’est pas connecté.` });
-    // Un seul onglet du destinataire reçoit l'argent, pour ne pas le créditer plusieurs fois
-    io.to(ids[0]).emit('receive_money', { amount, from: from.username });
-    from.balance = round2(from.balance - amount);
-    broadcastList();
-    ack({ ok: true, amount, to: users[ids[0]].username });
+    if (lower(target) === a._id) return ack({ ok: false, msg: 'Vous ne pouvez pas vous envoyer de l’argent à vous-même.' });
+    const ids = socketIdsOf(target), t = ids.length && accounts.get(users[ids[0]].key);
+    if (!t || !ensureState(t)) return ack({ ok: false, msg: `${target} n’est pas connecté.` });
+    try { Eco.debit(a.state, amount); } catch (e) { return failMsg(ack, e); }
+    Eco.credit(t.state, amount);
+    changed(a, []); changed(t, []);
+    io.to('u:' + t._id).emit('receive_money', { amount, from: a.username, st: Eco.snapshot(t.state) });
+    ack({ ok: true, amount, to: t.username, st: Eco.snapshot(a.state) });
   });
 
   /* ----- Handicaps : un joueur en ralentit un autre ----- */
   socket.on('sabotage', (data, ack) => {
     ack = reply(ack);
-    const from = users[socket.id];
-    if (!from) return ack({ ok: false, msg: 'Connectez-vous avant d’envoyer un handicap.' });
-    const item = SABOTAGES[clean(data && data.type, 20)];
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant d’envoyer un handicap.' });
+    const type = clean(data && data.type, 20), item = SABOTAGES[type];
     if (!item) return ack({ ok: false, msg: 'Handicap inconnu.' });
     if (!allow(socket, 'sabotage', 3000)) return ack({ ok: false, msg: 'Attendez quelques secondes entre deux handicaps.' });
-    if (from.balance + 0.001 < item.price) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    if (a.state.balance + 0.001 < item.price) return ack({ ok: false, msg: 'Solde insuffisant.' });
     const target = clean(data && data.targetUser, 24);
-    if (!target || lower(target) === lower(from.username)) return ack({ ok: false, msg: 'Choisissez un autre joueur que vous-même.' });
-    const ids = socketIdsOf(target);
-    if (!ids.length) return ack({ ok: false, msg: `${target} n’est plus connecté.` });
-    const key = lower(target), now = Date.now();
-    const log = (sabotageLog.get(key) || []).filter(t => now - t < SABOTAGE_WINDOW_MS);
+    if (!target || lower(target) === a._id) return ack({ ok: false, msg: 'Choisissez un autre joueur que vous-même.' });
+    const ids = socketIdsOf(target), t = ids.length && accounts.get(users[ids[0]].key);
+    if (!t || !ensureState(t)) return ack({ ok: false, msg: `${target} n’est plus connecté.` });
+    const key = t._id, now = Date.now();
+    const log = (sabotageLog.get(key) || []).filter(x => now - x < SABOTAGE_WINDOW_MS);
     if (log.length >= SABOTAGE_MAX) {
       const wait = Math.ceil((SABOTAGE_WINDOW_MS - (now - log[0])) / 60000);
-      return ack({ ok: false, msg: `${users[ids[0]].username} a déjà reçu ${SABOTAGE_MAX} handicaps récemment. Réessayez dans ${wait} min.` });
+      return ack({ ok: false, msg: `${t.username} a déjà reçu ${SABOTAGE_MAX} handicaps récemment. Réessayez dans ${wait} min.` });
     }
-    log.push(now);
-    sabotageLog.set(key, log);
-    // Un seul onglet du joueur visé reçoit le handicap, pour ne pas l'appliquer plusieurs fois
-    io.to(ids[0]).emit('sabotaged', { type: data.type, from: from.username });
-    from.balance = round2(from.balance - item.price);
-    broadcastList();
-    ack({ ok: true, to: users[ids[0]].username });
-  });
-
-  /* ----- Grosses victoires annoncées à tout le monde ----- */
-  socket.on('big_win', data => {
-    const u = users[socket.id];
-    if (!u || !allow(socket, 'bigwin', 4000)) return;
-    const amount = round2(data && data.amount), mult = Math.round(Number(data && data.mult) * 100) / 100;
-    if (!(amount >= 500) || !(amount < 1e13)) return;
-    const win = { username: u.username, game: clean(data.game, 24), amount, mult: Number.isFinite(mult) ? mult : 0, at: Date.now() };
-    bigWins.unshift(win);
-    bigWins.length = Math.min(bigWins.length, 10);
-    io.emit('big_win', win);
-  });
-
-  /* ----- Gains de la dernière heure (top 10 de l'accueil) ----- */
-  socket.on('game_win', data => {
-    const u = users[socket.id];
-    if (!u || !allow(socket, 'gamewin', 120)) return;
-    const amount = round2(data && data.amount), mult = Math.round(Number(data && data.mult) * 100) / 100;
-    if (!(amount > 0 && amount < 1e13)) return;
-    hourWins.push({ username: u.username, game: clean(data.game, 24), amount, mult: Number.isFinite(mult) ? mult : 0, at: Date.now() });
-    if (hourWins.length > 20000) hourWins.splice(0, hourWins.length - 20000);
-    broadcastTop(false);
-  });
-
-  /* ----- Gros multiplicateurs du Plinko, partagés ----- */
-  socket.on('plinko_big', data => {
-    const u = users[socket.id];
-    if (!u || !allow(socket, 'plinkobig', 300)) return;
-    const mult = Number(data && data.mult), rows = Number(data && data.rows), risk = clean(data && data.risk, 10);
-    if (!(mult >= 10 && mult <= 1000) || ![8, 12, 16].includes(rows) || !['faible', 'moyen', 'eleve'].includes(risk)) return;
-    const hit = { username: u.username, mult, rows, risk, bet: round2(data.bet), win: round2(data.win), at: Date.now() };
-    plinkoBig.unshift(hit);
-    plinkoBig.length = Math.min(plinkoBig.length, 20);
-    io.emit('plinko_big', hit);
-  });
-
-  socket.on('place_bet', data => {
-    const u = users[socket.id];
-    if (!u || !allow(socket, 'bet', 300)) return;
-    const amount = round2(data && data.amount);
-    if (!(amount > 0)) return;
-    io.emit('live_bet', { username: u.username, game: clean(data.game, 20), amount });
+    log.push(now); sabotageLog.set(key, log);
+    Eco.debit(a.state, item.price);
+    a.state.c.sabotages++;
+    Eco.receiveSabotage(t.state, type, a.username);
+    changed(a, []); changed(t, []);
+    io.to('u:' + key).emit('sabotaged', { type, from: a.username, st: Eco.snapshot(t.state) });
+    ack({ ok: true, to: t.username, st: Eco.snapshot(a.state) });
   });
 
   /* ----- Aviateur ----- */
   socket.on('crash_bet', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant de miser.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant de miser.' });
     if (round.phase !== 'betting') return ack({ ok: false, msg: 'Les mises sont fermées pour cette manche.' });
-    const key = lower(u.username);
+    const key = a._id;
     if (round.bets.has(key)) return ack({ ok: false, msg: 'Vous avez déjà misé sur cette manche.' });
     const amount = round2(data && data.amount);
     if (!Number.isFinite(amount) || amount < MIN_BET) return ack({ ok: false, msg: `Mise minimum : ${MIN_BET} $.` });
-    if (amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    try { Eco.debit(a.state, amount); } catch (e) { return failMsg(ack, e); }
     let auto = Number(data && data.auto);
     auto = Number.isFinite(auto) && auto >= 1.01 ? floor2(Math.min(auto, 10000)) : 0;
-    round.bets.set(key, { username: u.username, amount, auto, cashedAt: null, payout: 0 });
+    round.bets.set(key, { username: a.username, key, season: a.state.season, amount, auto, cashedAt: null, payout: 0 });
+    changed(a, [{ type: 'bet', game: 'Aviateur', amount }]);
     broadcastBets();
-    ack({ ok: true, roundId: round.id, amount, auto });
+    ack({ ok: true, roundId: round.id, amount, auto, st: Eco.snapshot(a.state) });
   });
 
   socket.on('crash_cancel', (_, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Non connecté.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Non connecté.' });
     if (round.phase !== 'betting') return ack({ ok: false, msg: 'Trop tard : l’avion a décollé.' });
-    const key = lower(u.username), b = round.bets.get(key);
+    const b = round.bets.get(a._id);
     if (!b) return ack({ ok: false, msg: 'Aucune mise à annuler.' });
-    round.bets.delete(key);
+    round.bets.delete(a._id);
+    Eco.credit(a.state, b.amount);
+    changed(a, []);
     broadcastBets();
-    ack({ ok: true, amount: b.amount });
+    ack({ ok: true, amount: b.amount, st: Eco.snapshot(a.state) });
   });
 
   socket.on('crash_cashout', (_, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Non connecté.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Non connecté.' });
     if (round.phase !== 'running') return ack({ ok: false, msg: 'Trop tard : l’avion a crashé.' });
-    const b = round.bets.get(lower(u.username));
+    const b = round.bets.get(a._id);
     if (!b || b.cashedAt != null) return ack({ ok: false, msg: 'Aucune mise en vol.' });
     const m = multAt(Date.now());
     if (m >= round.point) return ack({ ok: false, msg: 'Trop tard : l’avion a crashé.' });
@@ -771,12 +863,11 @@ io.on('connection', socket => {
     ack({ ok: true, mult: m, payout: b.payout });
   });
 
-  // Après un rechargement de page : que s'est-il passé pour ma mise ?
   socket.on('crash_result', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ status: 'unknown' });
-    const roundId = clean(data && data.roundId, 20), key = lower(u.username);
+    const a = acct();
+    if (!a) return ack({ status: 'unknown' });
+    const roundId = clean(data && data.roundId, 20), key = a._id;
     if (round.id === roundId && round.bets.has(key) && round.phase !== 'crashed') {
       const b = round.bets.get(key);
       if (b.cashedAt != null) return ack({ status: 'cashed', mult: b.cashedAt, payout: b.payout });
@@ -793,19 +884,17 @@ io.on('connection', socket => {
     if (!NAME_RE.test(username)) return ack({ ok: false, msg: 'Pseudo invalide : 3 à 16 lettres, chiffres, point, tiret ou tiret bas.' });
     if (/^invit/i.test(username)) return ack({ ok: false, msg: 'Les pseudos commençant par « Invité » sont réservés.' });
     if (pw.length < 6 || pw.length > 200) return ack({ ok: false, msg: 'Mot de passe : 6 caractères minimum.' });
+    if (!season) return ack({ ok: false, msg: 'Le serveur démarre : réessayez dans quelques secondes.' });
     const key = lower(username);
     if (await getAccount(key)) return ack({ ok: false, code: 'taken', msg: 'Ce pseudo est déjà pris.' });
+    if (!ipAllowed(socket, 'register', 5)) return ack({ ok: false, msg: 'Trop de comptes créés depuis cette connexion : réessayez dans une heure.' });
     const salt = crypto.randomBytes(16).toString('hex');
-    if (!season) return ack({ ok: false, msg: 'Le serveur démarre : réessayez dans quelques secondes.' });
-    let state = cleanState(data && data.state);
-    if (state && Number(state.season) !== season.num) state = null; // progression d'une autre saison : on repart de zéro
-    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state, savedAt: state ? Number(state.savedAt) || Date.now() : 0,
-      created: Date.now(), imported: !!(data && data.imported), tokens: [], heritage: [], season: season.num };
-    if (a.imported) addHeritage(a, 'PIONNIER BÊTA', 'Pionnier de la bêta', 0, 'beta');
+    // La progression envoyée par le navigateur est ignorée : tout nouveau compte part du solde de départ
+    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state: null, savedAt: Date.now(), created: Date.now(), tokens: [], heritage: [], season: season.num };
     const token = newToken(a);
     persist(a);
-    bindAccount(socket, a);
-    ack(publicAccount(a, token));
+    const session = bindAccount(socket, a);
+    ack(publicAccount(a, token, session));
   });
 
   socket.on('account_login', async (data, ack) => {
@@ -814,12 +903,11 @@ io.on('connection', socket => {
     const key = lower(String((data && data.username) || '').trim()), pw = String((data && data.password) || '');
     if (tooManyFails(key)) return ack({ ok: false, msg: 'Trop de tentatives : réessayez dans quelques minutes.' });
     const a = await getAccount(key);
-    if (!a) return ack({ ok: false, code: 'not_found', msg: 'Pseudo ou mot de passe incorrect.' });
-    if (a.guest || await scryptHash(pw, a.salt) !== a.hash) { loginFails.get(key).push(Date.now()); return ack({ ok: false, msg: 'Pseudo ou mot de passe incorrect.' }); }
+    if (!a || a.guest || await scryptHash(pw, a.salt) !== a.hash) { loginFails.get(key).push(Date.now()); return ack({ ok: false, msg: 'Pseudo ou mot de passe incorrect.' }); }
     const token = newToken(a);
     persist(a);
-    bindAccount(socket, a);
-    ack(publicAccount(a, token));
+    const session = bindAccount(socket, a);
+    ack(publicAccount(a, token, session));
   });
 
   socket.on('account_resume', async (data, ack) => { // reconnexion automatique avec le jeton de l'appareil
@@ -827,29 +915,31 @@ io.on('connection', socket => {
     const key = lower(String((data && data.username) || '')), t = String((data && data.token) || '');
     const a = key && t ? await getAccount(key) : null;
     if (!a || !(a.tokens || []).some(x => x.t === tokenHash(t))) return ack({ ok: false, code: 'invalid', msg: 'Session expirée : reconnectez-vous.' });
-    bindAccount(socket, a);
-    ack(publicAccount(a, t));
+    const session = bindAccount(socket, a);
+    ack(publicAccount(a, t, session));
   });
 
+  // Seuls les réglages d'apparence sont lus (thème, titre porté, gemme, mode rapide), et seulement s'ils sont possédés
   socket.on('account_save', (data, ack) => {
     ack = reply(ack);
     const a = socket.data.account && accounts.get(socket.data.account);
     if (!a) return ack({ ok: false, code: 'auth' });
     if (!socket.data.active) return ack({ ok: false, code: 'replaced' });
-    const state = cleanState(data && data.state);
-    if (!state) return ack({ ok: false, msg: 'Sauvegarde trop volumineuse ou invalide.' });
-    if (season && Number(state.season) !== season.num) return ack({ ok: false, code: 'season' }); // partie d'une saison terminée
-    if (Number(state.passVersion) !== Seasons.PASS_VERSION) Seasons.resetPassState(state); // site pas encore à jour : pas d'ancienne XP
-    a.state = state;
-    a.savedAt = Number(state.savedAt) || Date.now();
+    if (!ensureState(a)) return ack({ ok: false, msg: 'Le serveur démarre.' });
+    const sent = data && data.state;
+    if (sent && season && Number(sent.season) && Number(sent.season) !== season.num) return ack({ ok: false, code: 'season' });
+    const before = JSON.stringify([a.state.theme, a.state.equippedBadge, a.state.coinSkin, a.state.fast]);
+    Eco.applyCosmetics(a.state, sent, a.heritage);
+    if (JSON.stringify([a.state.theme, a.state.equippedBadge, a.state.coinSkin, a.state.fast]) !== before) broadcastList();
     persist(a);
-    ack({ ok: true, savedAt: a.savedAt });
+    ack({ ok: true, savedAt: Date.now() });
   });
 
   socket.on('account_logout', (data, ack) => {
     ack = reply(ack);
     const a = socket.data.account && accounts.get(socket.data.account), t = String((data && data.token) || '');
     if (a && t) { a.tokens = (a.tokens || []).filter(x => x.t !== tokenHash(t)); persist(a); }
+    if (a) closeSession(socket, a);
     socket.data.account = null; socket.data.active = false;
     ack({ ok: true });
   });
@@ -874,17 +964,18 @@ io.on('connection', socket => {
     ack = reply(ack);
     if (!allow(socket, 'register', 1000)) return ack({ ok: false, msg: 'Doucement : réessayez dans une seconde.' });
     if (!season) return ack({ ok: false, msg: 'Le serveur démarre : réessayez dans quelques secondes.' });
+    if (!ipAllowed(socket, 'guest', 5)) return ack({ ok: false, msg: 'Trop de parties invité créées depuis cette connexion : réessayez dans une heure.' });
     let username = '', key = '';
     for (let i = 0; i < 20; i++) {
       username = 'Invité_' + crypto.randomInt(100000, 1000000);
       key = lower(username);
       if (!(await getAccount(key))) break;
     }
-    const a = { _id: key, username, guest: true, salt: '', hash: '', state: null, savedAt: 0, created: Date.now(), tokens: [], heritage: [], season: season.num };
+    const a = { _id: key, username, guest: true, salt: '', hash: '', state: null, savedAt: Date.now(), created: Date.now(), tokens: [], heritage: [], season: season.num };
     const token = newToken(a);
     persist(a);
-    bindAccount(socket, a);
-    ack(publicAccount(a, token));
+    const session = bindAccount(socket, a);
+    ack(publicAccount(a, token, session));
   });
 
   socket.on('account_claim', async (data, ack) => { // un invité choisit un pseudo et un mot de passe : sa partie est conservée
@@ -898,26 +989,27 @@ io.on('connection', socket => {
     if (pw.length < 6 || pw.length > 200) return ack({ ok: false, msg: 'Mot de passe : 6 caractères minimum.' });
     const key = lower(username);
     if (await getAccount(key)) return ack({ ok: false, code: 'taken', msg: 'Ce pseudo est déjà pris.' });
+    if (round.bets.has(g._id) || race.bets.has(g._id) || [...duels.values()].some(d => d.fromKey === g._id)) return ack({ ok: false, msg: 'Attendez la fin de vos mises en cours (Aviateur, Course, Duels) avant de créer votre compte.' });
     const salt = crypto.randomBytes(16).toString('hex');
-    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state: g.state, savedAt: g.savedAt, created: Date.now(), tokens: [], heritage: g.heritage || [], season: g.season };
+    const a = { _id: key, username, salt, hash: await scryptHash(pw, salt), state: g.state, priv: g.priv, eco: g.eco, savedAt: Date.now(), created: Date.now(), tokens: [], heritage: g.heritage || [], season: g.season };
     const token = newToken(a);
     persist(a);
+    if (loto.tickets[g._id]) { loto.tickets[key] = { ...loto.tickets[g._id], username }; delete loto.tickets[g._id]; saveLoto(); }
     removeAccount(g._id);
-    bindAccount(socket, a);
-    const u = users[socket.id];
-    if (u) { socket.leave('u:' + lower(u.username)); delete users[socket.id]; broadcastList(); }
-    ack(publicAccount(a, token));
+    socket.leave('u:' + g._id);
+    const session = bindAccount(socket, a);
+    ack(publicAccount(a, token, session));
   });
 
   /* ----- Duels ----- */
   socket.on('duel_create', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant de lancer un duel.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant de lancer un duel.' });
     if (!allow(socket, 'duel', 1500)) return ack({ ok: false, msg: 'Attendez un instant entre deux défis.' });
-    const amount = round2(data && data.amount), key = lower(u.username);
+    const amount = round2(data && data.amount), key = a._id;
     if (!Number.isFinite(amount) || amount < DUEL_MIN) return ack({ ok: false, msg: `Mise minimum : ${DUEL_MIN} $.` });
-    if (amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
+    if (amount > a.state.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
     if ([...duels.values()].filter(d => d.fromKey === key).length >= DUEL_MAX_OPEN) return ack({ ok: false, msg: `${DUEL_MAX_OPEN} défis ouverts au maximum.` });
     let toKey = null, toName = null;
     const target = clean(data && data.target, 24);
@@ -925,41 +1017,49 @@ io.on('connection', socket => {
       const ids = socketIdsOf(target);
       if (!ids.length) return ack({ ok: false, msg: `${target} n’est pas connecté.` });
       if (lower(target) === key) return ack({ ok: false, msg: 'Vous ne pouvez pas vous défier vous-même.' });
-      toKey = lower(target); toName = users[ids[0]].username;
+      toKey = users[ids[0]].key; toName = users[ids[0]].username;
     }
-    const d = { id: crypto.randomBytes(6).toString('hex'), from: u.username, fromKey: key, toKey, toName, amount, at: Date.now() };
+    Eco.debit(a.state, amount);
+    const d = { id: crypto.randomBytes(6).toString('hex'), from: a.username, fromKey: key, toKey, toName, amount, season: a.state.season, at: Date.now() };
     duels.set(d.id, d);
-    u.balance = round2(u.balance - amount);
+    changed(a, []);
     broadcastDuels();
     if (toKey) io.to('u:' + toKey).emit('duel_invite', { id: d.id, from: d.from, amount });
-    ack({ ok: true, id: d.id, amount });
+    ack({ ok: true, id: d.id, amount, st: Eco.snapshot(a.state) });
   });
 
   socket.on('duel_cancel', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id], d = duels.get(clean(data && data.id, 20));
-    if (!u || !d || d.fromKey !== lower(u.username)) return ack({ ok: false, msg: 'Ce défi n’est plus ouvert.' });
+    const a = acct(), d = duels.get(clean(data && data.id, 20));
+    if (!a || !d || d.fromKey !== a._id) return ack({ ok: false, msg: 'Ce défi n’est plus ouvert.' });
     closeDuel(d.id, 'cancelled');
     ack({ ok: true, amount: d.amount });
   });
 
   socket.on('duel_accept', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant d’accepter un duel.' });
-    const d = duels.get(clean(data && data.id, 20)), key = lower(u.username);
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant d’accepter un duel.' });
+    const d = duels.get(clean(data && data.id, 20)), key = a._id;
     if (!d) return ack({ ok: false, msg: 'Ce duel n’est plus disponible.' });
     if (d.fromKey === key) return ack({ ok: false, msg: 'Vous ne pouvez pas accepter votre propre défi.' });
     if (d.toKey && d.toKey !== key) return ack({ ok: false, msg: `Ce duel est réservé à ${d.toName}.` });
-    if (d.amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant pour relever ce défi.' });
-    if (!socketIdsOf(d.from).length) { closeDuel(d.id, 'cancelled'); return ack({ ok: false, msg: `${d.from} n’est plus connecté : duel annulé.` }); }
+    if (d.amount > a.state.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant pour relever ce défi.' });
+    const c = accounts.get(d.fromKey);
+    if (!socketIdsOf(d.from).length || !c || !c.state || c.state.season !== d.season) { closeDuel(d.id, 'cancelled'); return ack({ ok: false, msg: `${d.from} n’est plus connecté : duel annulé.` }); }
     duels.delete(d.id); // retiré tout de suite : personne d'autre ne peut l'accepter
+    Eco.debit(a.state, d.amount);
     const creatorWins = crypto.randomInt(0, 2) === 0;
-    const r = { id: d.id, status: 'done', a: d.from, b: u.username, winner: creatorWins ? d.from : u.username, loser: creatorWins ? u.username : d.from, amount: d.amount, at: Date.now() };
+    const r = { id: d.id, status: 'done', a: d.from, b: a.username, winner: creatorWins ? d.from : a.username, loser: creatorWins ? a.username : d.from, amount: d.amount, at: Date.now() };
     duelResults.set(d.id, r); keepResults();
-    u.balance = round2(u.balance - d.amount);
-    ack({ ok: true, ...r });
-    io.to('u:' + d.fromKey).to('u:' + key).emit('duel_result', r);
+    for (const [acc, won] of [[c, creatorWins], [a, !creatorWins]]) {
+      const ev = [];
+      if (won) acc.state.c.duelWins++;
+      Eco.settle(acc.state, ev, 'Duel', d.amount, won ? round2(d.amount * 2) : 0, won ? 2 : 0, { raw: true }); // ni boost ni handicap
+      changed(acc, ev);
+    }
+    ack({ ok: true, ...r, st: Eco.snapshot(a.state) });
+    io.to('u:' + d.fromKey).emit('duel_result', { ...r, st: Eco.snapshot(c.state) });
     io.emit('chat_message', { system: true, text: `Duel : ${r.winner} bat ${r.loser} et remporte ${money2(r.amount * 2)}.` });
     broadcastDuels();
   });
@@ -973,71 +1073,75 @@ io.on('connection', socket => {
   /* ----- Loto quotidien ----- */
   socket.on('loto_buy', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant d’acheter des tickets.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant d’acheter des tickets.' });
     if (!allow(socket, 'loto', 800)) return ack({ ok: false, msg: 'Doucement : un achat à la fois.' });
     const count = Math.floor(Number(data && data.count));
     if (!(count >= 1 && count <= LOTO_MAX_TICKETS)) return ack({ ok: false, msg: 'Nombre de tickets invalide.' });
-    const key = lower(u.username), cur = loto.tickets[key] ? loto.tickets[key].n : 0;
+    const key = a._id, cur = loto.tickets[key] ? loto.tickets[key].n : 0;
     if (cur + count > LOTO_MAX_TICKETS) return ack({ ok: false, msg: `${LOTO_MAX_TICKETS} tickets au maximum par tirage (vous en avez ${cur}).` });
     const cost = count * LOTO_PRICE;
-    if (cost > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
-    loto.tickets[key] = { username: u.username, n: cur + count };
-    u.balance = round2(u.balance - cost);
+    try { Eco.debit(a.state, cost); } catch (e) { return failMsg(ack, e); }
+    loto.tickets[key] = { username: a.username, n: cur + count };
+    const st = a.state, t = st.loto[loto.id] || { n: 0, paid: 0 };
+    st.loto[loto.id] = { n: cur + count, paid: round2(t.paid + cost) };
+    st.c.lotoTickets += count;
+    Eco.xpAdd(st, Eco.XP_TICKET * count);
+    changed(a, []);
     saveLoto();
     broadcastLoto();
-    ack({ ok: true, drawId: loto.id, count, total: cur + count, cost });
+    ack({ ok: true, drawId: loto.id, count, total: cur + count, cost, st: Eco.snapshot(st) });
   });
 
+  // Les gains du loto sont versés au moment du tirage : ceci ne sert plus qu'à afficher le résultat
   socket.on('loto_result', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false });
-    const id = clean(data && data.drawId, 24), key = lower(u.username);
+    const a = acct();
+    if (!a) return ack({ ok: false });
+    const id = clean(data && data.drawId, 24);
     if (id === loto.id) return ack({ status: 'open' });
-    const r = lotoClaims[id] && lotoClaims[id][key];
-    if (!r) return ack({ status: 'unknown' });
-    if (r.claimed) return ack({ status: 'claimed' });
-    r.claimed = true;
-    saveLoto();
-    ack({ status: 'drawn', win: r.win, tickets: r.tickets });
+    const r = lotoClaims[id] && lotoClaims[id][a._id];
+    ack(r ? { status: 'drawn', win: r.win, tickets: r.tickets, paid: true } : { status: 'unknown' });
   });
 
   /* ----- Course de chevaux ----- */
   socket.on('race_bet', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Connectez-vous avant de parier.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Connectez-vous avant de parier.' });
     if (race.phase !== 'betting') return ack({ ok: false, msg: 'Les paris sont fermés pour cette course.' });
-    const key = lower(u.username);
+    const key = a._id;
     if (race.bets.has(key)) return ack({ ok: false, msg: 'Vous avez déjà parié sur cette course.' });
     const horse = Number(data && data.horse);
     if (!Number.isInteger(horse) || horse < 0 || horse >= RACE_HORSES) return ack({ ok: false, msg: 'Cheval inconnu.' });
     const amount = round2(data && data.amount);
     if (!Number.isFinite(amount) || amount < RACE_MIN_BET) return ack({ ok: false, msg: `Mise minimum : ${RACE_MIN_BET} $.` });
-    if (amount > u.balance + 0.001) return ack({ ok: false, msg: 'Solde insuffisant.' });
-    race.bets.set(key, { username: u.username, horse, amount });
+    try { Eco.debit(a.state, amount); } catch (e) { return failMsg(ack, e); }
+    race.bets.set(key, { username: a.username, key, season: a.state.season, horse, amount });
+    changed(a, [{ type: 'bet', game: 'Course', amount }]);
     broadcastRaceBets();
-    ack({ ok: true, raceId: race.id, horse, amount, odds: race.odds[horse] });
+    ack({ ok: true, raceId: race.id, horse, amount, odds: race.odds[horse], st: Eco.snapshot(a.state) });
   });
 
   socket.on('race_cancel', (_, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ ok: false, msg: 'Non connecté.' });
+    const a = acct();
+    if (!a) return ack({ ok: false, msg: 'Non connecté.' });
     if (race.phase !== 'betting') return ack({ ok: false, msg: 'Trop tard : la course est partie.' });
-    const key = lower(u.username), b = race.bets.get(key);
+    const b = race.bets.get(a._id);
     if (!b) return ack({ ok: false, msg: 'Aucun pari à annuler.' });
-    race.bets.delete(key);
+    race.bets.delete(a._id);
+    Eco.credit(a.state, b.amount);
+    changed(a, []);
     broadcastRaceBets();
-    ack({ ok: true, amount: b.amount });
+    ack({ ok: true, amount: b.amount, st: Eco.snapshot(a.state) });
   });
 
   socket.on('race_result', (data, ack) => {
     ack = reply(ack);
-    const u = users[socket.id];
-    if (!u) return ack({ status: 'unknown' });
-    const raceId = clean(data && data.raceId, 20), key = lower(u.username);
+    const a = acct();
+    if (!a) return ack({ status: 'unknown' });
+    const raceId = clean(data && data.raceId, 20), key = a._id;
     if (race.id === raceId && race.bets.has(key) && race.phase !== 'finished') {
       const b = race.bets.get(key);
       return ack({ status: 'active', horse: b.horse, amount: b.amount, odds: race.odds[b.horse] });
@@ -1048,13 +1152,50 @@ io.on('connection', socket => {
   socket.on('disconnect', () => {
     const gone = users[socket.id];
     delete users[socket.id];
+    const a = socket.data.active && socket.data.account && accounts.get(socket.data.account);
+    if (a) closeSession(socket, a);
     if (gone && !socketIdsOf(gone.username).length) {
-      for (const d of [...duels.values()]) if (d.fromKey === lower(gone.username)) closeDuel(d.id, 'cancelled');
+      for (const d of [...duels.values()]) if (d.fromKey === gone.key) closeDuel(d.id, 'cancelled');
     }
     broadcastList();
-    // Les mises en cours restent actives : l'encaissement automatique fonctionne même hors ligne.
+    // Les mises de l'Aviateur et de la Course restent actives : elles sont réglées même hors ligne.
   });
 });
+
+/* Fin de session (déconnexion, fermeture du site) : parties en cours réglées, revenus arrêtés */
+function closeSession(socket, a) {
+  if (!a.state) return;
+  for (const [id, s] of io.of('/').sockets) if (id !== socket.id && s.data.account === a._id && s.data.active) return; // un autre onglet reste ouvert
+  const ev = [];
+  Eco.accrue(a.state, a.priv || (a.priv = {}));
+  Eco.resolveActive(a.state, a.priv, ev);
+  a.state.lastSeen = Date.now();
+  changed(a, ev);
+}
+
+/* Revenus automatiques des joueurs connectés, chaque seconde */
+const quietDirty = new Set();
+let incomeTicks = 0;
+setInterval(() => {
+  const now = Date.now(), done = new Set();
+  let any = false;
+  for (const s of io.of('/').sockets.values()) {
+    const a = s.data.active && s.data.account && accounts.get(s.data.account);
+    if (!a || done.has(a._id) || !a.state || !season || a.state.season !== season.num) continue;
+    done.add(a._id);
+    a.priv = a.priv || {};
+    const got = Eco.accrue(a.state, a.priv, now);
+    a.state.lastSeen = now;
+    quietDirty.add(a._id);
+    if (got > 0) {
+      Eco.touch(a.state); any = true;
+      const st = a.state;
+      s.emit('eco_patch', { rev: st.rev, balance: st.balance, clicker: st.clicker });
+    }
+  }
+  if (any && ++incomeTicks % 3 === 0) broadcastList(); // classement mis à jour toutes les 3 s
+}, 1000);
+setInterval(() => { quietDirty.forEach(id => { const a = accounts.get(id); if (a) persist(a); }); quietDirty.clear(); }, 15000);
 
 startBetting();
 startRaceBetting();
